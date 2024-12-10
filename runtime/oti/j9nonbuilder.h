@@ -3563,6 +3563,17 @@ typedef struct J9HookedNative {
 } J9HookedNative;
 
 /* @ddr_namespace: map_to_type=J9ClassLoader */
+typedef struct J9RAMClassFreeListBlockType {
+	struct J9RAMClassFreeListBlock* ramClassLargeBlockFreeList;
+	struct J9RAMClassFreeListBlock* ramClassSmallBlockFreeList;
+	struct J9RAMClassFreeListBlock* ramClassTinyBlockFreeList;
+} J9RAMClassFreeListBlockType;
+
+typedef struct RamClassUDATABlockFreelist {
+	UDATA* ramClassSub4gUDATABlockFreeList;
+	UDATA* ramClassFreqUDATABlockFreeList;	
+	UDATA* ramClassInFreqUDATABlockFreeList;
+} RamClassUDATABlockFreelist;
 
 typedef struct J9ClassLoader {
 	struct J9Pool* sharedLibraries;
@@ -3583,10 +3594,10 @@ typedef struct J9ClassLoader {
 #endif /* defined(J9VM_NEEDS_JNI_REDIRECTION) */
 	struct J9JITExceptionTable* jitMetaDataList;
 	struct J9MemorySegment* classSegments;
-	struct J9RAMClassFreeListBlock* ramClassLargeBlockFreeList;
-	struct J9RAMClassFreeListBlock* ramClassSmallBlockFreeList;
-	struct J9RAMClassFreeListBlock* ramClassTinyBlockFreeList;
-	UDATA* ramClassUDATABlockFreeList;
+	struct J9RAMClassFreeListBlockType *sub4gBlock;
+	struct J9RAMClassFreeListBlockType *frequentlyAccessedBlock;
+	struct J9RAMClassFreeListBlockType *inFrequentlyAccessedBlock;
+	struct RamClassUDATABlockFreelist *ramClassUDATABlocks;
 	struct J9HashTable* redefinedClasses;
 	struct J9NativeLibrary* librariesHead;
 	struct J9NativeLibrary* librariesTail;
