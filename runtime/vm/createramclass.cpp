@@ -4010,8 +4010,6 @@ internalAllocateRAMClass(J9JavaVM *javaVM, J9ClassLoader *classLoader, RAMClassA
 		for (request = requests; NULL != request; request = request->next) {
 			if(SUB4G == request->segmentType)
 			{
-				printf(">>>>>>>>>> value at line number %d in file %s\n", __LINE__, __FILE__);
-				printf(">>>>>>>>> request %p, classLoader %p, prev %p, classLoader->sub4gBlock %p, classLoader->ramClassUDATABlocks.ramClassSub4gUDATABlockFreeList %p", request, classLoader, prev, &classLoader->sub4gBlock, classLoader->ramClassUDATABlocks.ramClassSub4gUDATABlockFreeList);
 				allocateFreeListBlock (request, classLoader, prev, &classLoader->sub4gBlock, classLoader->ramClassUDATABlocks.ramClassSub4gUDATABlockFreeList);
 			} else if (FREQUENTLY_ACCESSED == request->segmentType)
 			{

@@ -77,7 +77,6 @@ Java_com_ibm_java_lang_management_internal_MemoryMXBeanImpl_getNonHeapMemoryUsag
 	classLoader = javaVM->internalVMFunctions->allClassLoadersStartDo(&walkState, javaVM, 0);
 	while (NULL != classLoader) {
 		
-		printf(">>>>>>>>>> value at line number %d in file %s\n", __LINE__, __FILE__);
 		RamClassUDATABlockFreelist *udataFreeListBlock = &classLoader->ramClassUDATABlocks;
 		J9RAMClassFreeListBlockType *sub4gFreeListBlock = &classLoader->sub4gBlock;
 		J9RAMClassFreeListBlockType *freqFreeListBlock = &classLoader->frequentlyAccessedBlock;
