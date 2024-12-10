@@ -76,10 +76,12 @@ Java_com_ibm_java_lang_management_internal_MemoryMXBeanImpl_getNonHeapMemoryUsag
 	omrthread_monitor_enter(javaVM->classTableMutex);
 	classLoader = javaVM->internalVMFunctions->allClassLoadersStartDo(&walkState, javaVM, 0);
 	while (NULL != classLoader) {
-		RamClassUDATABlockFreelist *udataFreeListBlock = classLoader->ramClassUDATABlocks;
-		J9RAMClassFreeListBlockType *sub4gFreeListBlock = classLoader->sub4gBlock;
-		J9RAMClassFreeListBlockType *freqFreeListBlock = classLoader->frequentlyAccessedBlock;
-		J9RAMClassFreeListBlockType *InFreqFreeListBlock = classLoader->inFrequentlyAccessedBlock;
+		
+		printf(">>>>>>>>>> value at line number %d in file %s\n", __LINE__, __FILE__);
+		RamClassUDATABlockFreelist *udataFreeListBlock = &classLoader->ramClassUDATABlocks;
+		J9RAMClassFreeListBlockType *sub4gFreeListBlock = &classLoader->sub4gBlock;
+		J9RAMClassFreeListBlockType *freqFreeListBlock = &classLoader->frequentlyAccessedBlock;
+		J9RAMClassFreeListBlockType *InFreqFreeListBlock = &classLoader->inFrequentlyAccessedBlock;
 		if (NULL != udataFreeListBlock) {
 			UDATA* sub4gListBlock = udataFreeListBlock->ramClassSub4gUDATABlockFreeList;
 			UDATA* freqListBlock = udataFreeListBlock->ramClassFreqUDATABlockFreeList;	

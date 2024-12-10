@@ -3756,7 +3756,7 @@ addBlockToLargeFreeList(J9ClassLoader *classLoader, J9RAMClassFreeListLargeBlock
 }
 
 static void
-addBlockToFreeList(J9ClassLoader *classLoader, UDATA address, UDATA size, UDATA *ramClassUDATABlockFreelist, J9RAMClassFreeListBlockType *blockType)
+addBlockToFreeList(J9ClassLoader *classLoader, UDATA address, UDATA size, J9RAMClassFreeListBlockType *blockType, UDATA *ramClassUDATABlockFreelist)
 {
 	if (J9_ARE_ANY_BITS_SET(classLoader->flags, J9CLASSLOADER_ANON_CLASS_LOADER)) {
 		/* We support individual class unloading for anonymous classes, so each anonymous class
@@ -3860,12 +3860,12 @@ allocateRAMClassFragmentFromFreeList(RAMClassAllocationRequest *request, J9RAMCl
 
 			/* Add a new block with the remaining space at the start of this block, if any, to an appropriate free list */
 			if (0 != alignmentShift) {
-				addBlockToFreeList(classLoader, (UDATA) freeListBlock, alignmentShift, ramClassUDATABlockFreelist, blockType);
+				addBlockToFreeList(classLoader, (UDATA) freeListBlock, alignmentShift, blockType, ramClassUDATABlockFreelist);
 			}
 
 			/* Add a new block with the remaining space at the end of this block, if any, to an appropriate free list */
 			if (0 != newBlockSize) {
-				addBlockToFreeList(classLoader, ((UDATA) freeListBlock) + alignmentShift + request->fragmentSize, newBlockSize, ramClassUDATABlockFreelist, blockType);
+				addBlockToFreeList(classLoader, ((UDATA) freeListBlock) + alignmentShift + request->fragmentSize, newBlockSize, blockType, ramClassUDATABlockFreelist);
 			}
 
 			return TRUE;
@@ -4010,13 +4010,15 @@ internalAllocateRAMClass(J9JavaVM *javaVM, J9ClassLoader *classLoader, RAMClassA
 		for (request = requests; NULL != request; request = request->next) {
 			if(SUB4G == request->segmentType)
 			{
-				allocateFreeListBlock (request, classLoader, prev, classLoader->sub4gBlock, classLoader->ramClassUDATABlocks->ramClassSub4gUDATABlockFreeList);
+				printf(">>>>>>>>>> value at line number %d in file %s\n", __LINE__, __FILE__);
+				printf(">>>>>>>>> request %p, classLoader %p, prev %p, classLoader->sub4gBlock %p, classLoader->ramClassUDATABlocks.ramClassSub4gUDATABlockFreeList %p", request, classLoader, prev, &classLoader->sub4gBlock, classLoader->ramClassUDATABlocks.ramClassSub4gUDATABlockFreeList);
+				allocateFreeListBlock (request, classLoader, prev, &classLoader->sub4gBlock, classLoader->ramClassUDATABlocks.ramClassSub4gUDATABlockFreeList);
 			} else if (FREQUENTLY_ACCESSED == request->segmentType)
 			{
-				allocateFreeListBlock (request, classLoader, prev, classLoader->frequentlyAccessedBlock, classLoader->ramClassUDATABlocks->ramClassFreqUDATABlockFreeList);
+				allocateFreeListBlock (request, classLoader, prev, &classLoader->frequentlyAccessedBlock, classLoader->ramClassUDATABlocks.ramClassFreqUDATABlockFreeList);
 			} else if (INFREQUENTLY_ACCESSED == request->segmentType)
 			{
-				allocateFreeListBlock (request, classLoader, prev, classLoader->inFrequentlyAccessedBlock, classLoader->ramClassUDATABlocks->ramClassInFreqUDATABlockFreeList);
+				allocateFreeListBlock (request, classLoader, prev, &classLoader->inFrequentlyAccessedBlock, classLoader->ramClassUDATABlocks.ramClassInFreqUDATABlockFreeList);
 			}
 			prev = request;
 		}
@@ -4057,13 +4059,13 @@ internalAllocateRAMClass(J9JavaVM *javaVM, J9ClassLoader *classLoader, RAMClassA
 					UDATA fragmentAddress = ((UDATA) allocationRequests[i].address) - allocationRequests[i].prefixSize;
 					if(SUB4G == allocationRequests[i].segmentType)
 					{
-						addBlockToFreeList(classLoader, fragmentAddress, allocationRequests[i].fragmentSize, classLoader->ramClassUDATABlocks->ramClassSub4gUDATABlockFreeList, classLoader->sub4gBlock);
+						addBlockToFreeList(classLoader, fragmentAddress, allocationRequests[i].fragmentSize, &classLoader->sub4gBlock, classLoader->ramClassUDATABlocks.ramClassSub4gUDATABlockFreeList);
 					} else if (FREQUENTLY_ACCESSED == allocationRequests[i].segmentType)
 					{	
-						addBlockToFreeList(classLoader, fragmentAddress, allocationRequests[i].fragmentSize, classLoader->ramClassUDATABlocks->ramClassFreqUDATABlockFreeList, classLoader->frequentlyAccessedBlock);
+						addBlockToFreeList(classLoader, fragmentAddress, allocationRequests[i].fragmentSize, &classLoader->frequentlyAccessedBlock, classLoader->ramClassUDATABlocks.ramClassFreqUDATABlockFreeList);
 					} else if (INFREQUENTLY_ACCESSED == allocationRequests[i].segmentType)
 					{
-						addBlockToFreeList(classLoader, fragmentAddress, allocationRequests[i].fragmentSize, classLoader->ramClassUDATABlocks->ramClassInFreqUDATABlockFreeList, classLoader->inFrequentlyAccessedBlock);
+						addBlockToFreeList(classLoader, fragmentAddress, allocationRequests[i].fragmentSize, &classLoader->inFrequentlyAccessedBlock, classLoader->ramClassUDATABlocks.ramClassInFreqUDATABlockFreeList);
 					}
 					allocationRequests[i].address = NULL;
 				}
@@ -4095,13 +4097,13 @@ internalAllocateRAMClass(J9JavaVM *javaVM, J9ClassLoader *classLoader, RAMClassA
 			if (0 != alignmentShift) {
 				if(SUB4G == request->segmentType)
 				{
-					addBlockToFreeList(classLoader, (UDATA) allocAddress, alignmentShift, classLoader->ramClassUDATABlocks->ramClassSub4gUDATABlockFreeList, classLoader->sub4gBlock);
+					addBlockToFreeList(classLoader, (UDATA) allocAddress, alignmentShift, &classLoader->sub4gBlock, classLoader->ramClassUDATABlocks.ramClassSub4gUDATABlockFreeList);
 				} else if (FREQUENTLY_ACCESSED == request->segmentType)
 				{	
-					addBlockToFreeList(classLoader, (UDATA) allocAddress, alignmentShift, classLoader->ramClassUDATABlocks->ramClassFreqUDATABlockFreeList, classLoader->frequentlyAccessedBlock);
+					addBlockToFreeList(classLoader, (UDATA) allocAddress, alignmentShift, &classLoader->frequentlyAccessedBlock, classLoader->ramClassUDATABlocks.ramClassFreqUDATABlockFreeList);
 				} else if (INFREQUENTLY_ACCESSED == request->segmentType)
 				{
-					addBlockToFreeList(classLoader, (UDATA) allocAddress, alignmentShift, classLoader->ramClassUDATABlocks->ramClassInFreqUDATABlockFreeList, classLoader->inFrequentlyAccessedBlock);
+					addBlockToFreeList(classLoader, (UDATA) allocAddress, alignmentShift, &classLoader->inFrequentlyAccessedBlock, classLoader->ramClassUDATABlocks.ramClassInFreqUDATABlockFreeList);
 				}
 			}
 
@@ -4112,16 +4114,18 @@ internalAllocateRAMClass(J9JavaVM *javaVM, J9ClassLoader *classLoader, RAMClassA
 
 		/* Add a new block with the remaining space at the end of this segment, if any, to an appropriate free list */
 		if (allocAddress != (UDATA) newSegment->heapTop) {
-			if(SUB4G == request->segmentType)
-			{
-				addBlockToFreeList(classLoader, (UDATA) allocAddress, ((UDATA) newSegment->heapTop) - allocAddress, classLoader->ramClassUDATABlocks->ramClassSub4gUDATABlockFreeList, classLoader->sub4gBlock);
-			} else if (FREQUENTLY_ACCESSED == request->segmentType)
-			{	
-				addBlockToFreeList(classLoader, (UDATA) allocAddress, ((UDATA) newSegment->heapTop) - allocAddress, classLoader->ramClassUDATABlocks->ramClassFreqUDATABlockFreeList, classLoader->frequentlyAccessedBlock);
-			} else if (INFREQUENTLY_ACCESSED == request->segmentType)
-			{
-				addBlockToFreeList(classLoader, (UDATA) allocAddress, ((UDATA) newSegment->heapTop) - allocAddress, classLoader->ramClassUDATABlocks->ramClassInFreqUDATABlockFreeList, classLoader->inFrequentlyAccessedBlock);
-			}
+			addBlockToFreeList(classLoader, (UDATA) allocAddress, ((UDATA) newSegment->heapTop) - allocAddress, &classLoader->inFrequentlyAccessedBlock, classLoader->ramClassUDATABlocks.ramClassInFreqUDATABlockFreeList);
+			
+			// if(SUB4G == request->segmentType)
+			// {
+			// 	addBlockToFreeList(classLoader, (UDATA) allocAddress, ((UDATA) newSegment->heapTop) - allocAddress, &classLoader->sub4gBlock, classLoader->ramClassUDATABlocks.ramClassSub4gUDATABlockFreeList);
+			// } else if (FREQUENTLY_ACCESSED == request->segmentType)
+			// {	
+			// 	addBlockToFreeList(classLoader, (UDATA) allocAddress, ((UDATA) newSegment->heapTop) - allocAddress, &classLoader->frequentlyAccessedBlock, classLoader->ramClassUDATABlocks.ramClassFreqUDATABlockFreeList);
+			// } else if (INFREQUENTLY_ACCESSED == request->segmentType)
+			// {
+			// 	addBlockToFreeList(classLoader, (UDATA) allocAddress, ((UDATA) newSegment->heapTop) - allocAddress, &classLoader->inFrequentlyAccessedBlock, classLoader->ramClassUDATABlocks.ramClassInFreqUDATABlockFreeList);
+			// }
 		}
 	}
 

@@ -3594,10 +3594,10 @@ typedef struct J9ClassLoader {
 #endif /* defined(J9VM_NEEDS_JNI_REDIRECTION) */
 	struct J9JITExceptionTable* jitMetaDataList;
 	struct J9MemorySegment* classSegments;
-	struct J9RAMClassFreeListBlockType *sub4gBlock;
-	struct J9RAMClassFreeListBlockType *frequentlyAccessedBlock;
-	struct J9RAMClassFreeListBlockType *inFrequentlyAccessedBlock;
-	struct RamClassUDATABlockFreelist *ramClassUDATABlocks;
+	struct J9RAMClassFreeListBlockType sub4gBlock;
+	struct J9RAMClassFreeListBlockType frequentlyAccessedBlock;
+	struct J9RAMClassFreeListBlockType inFrequentlyAccessedBlock;
+	struct RamClassUDATABlockFreelist ramClassUDATABlocks;
 	struct J9HashTable* redefinedClasses;
 	struct J9NativeLibrary* librariesHead;
 	struct J9NativeLibrary* librariesTail;
