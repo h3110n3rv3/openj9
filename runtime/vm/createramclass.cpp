@@ -3961,9 +3961,11 @@ allocateRemainingFragments(RAMClassAllocationRequest *requests, UDATA allocation
 		BOOLEAN isLoadedByAnonClassLoader = classLoader == javaVM->anonClassLoader;
 		RAMClassAllocationRequest *request = NULL;
 		UDATA fragmentsLeftToAllocate = 0;
+		BOOLEAN isNotLoadedByAnonClassLoader = classLoader != javaVM->anonClassLoader;
+		
 		for (request = requests; NULL != request; request = request->next) {
-			if ((request->address == NULL)
-				&& (request->segmentKind == segmentKind)) {
+			if (((request->address == NULL) && (request->segmentKind == segmentKind))
+				|| (!isNotLoadedByAnonClassLoader)) {
 				fragmentsLeftToAllocate++;
 				newSegmentSize += request->fragmentSize + request->alignment;
 			}
@@ -3989,7 +3991,8 @@ allocateRemainingFragments(RAMClassAllocationRequest *requests, UDATA allocation
 			/* Free allocated fragments */
 			/* TODO attempt to coalesce free blocks? */
 			for (i = 0; i < allocationRequestCount; i++) {
-				if (NULL != allocationRequests[i].address && allocationRequests[i].segmentKind == segmentKind) {
+				if ((NULL != allocationRequests[i].address && allocationRequests[i].segmentKind == segmentKind)
+					|| (!isNotLoadedByAnonClassLoader)) {
 					UDATA fragmentAddress = ((UDATA) allocationRequests[i].address) - allocationRequests[i].prefixSize;
 					addBlockToFreeList(classLoader, fragmentAddress, allocationRequests[i].fragmentSize, j9RamClassFreeList, ramClassUDATABlockFreelist);
 					allocationRequests[i].address = NULL;
@@ -4009,8 +4012,8 @@ allocateRemainingFragments(RAMClassAllocationRequest *requests, UDATA allocation
 		/* Allocate the remaining fragments in the new segment, adding holes to the free list */
 		allocAddress = ((UDATA) newSegment->heapBase) + sizeof(UDATA);
 		for (request = requests; NULL != request; request = request->next) {
-			if ((request->address == NULL)
-				&& (request->segmentKind == segmentKind)) {
+			if (((request->address == NULL) && (request->segmentKind == segmentKind))
+				|| (!isNotLoadedByAnonClassLoader)) {
 				/* Allocate from the start of the segment */
 				UDATA addressForAlignedArea = allocAddress + request->prefixSize;
 				UDATA alignmentMod = addressForAlignedArea & (request->alignment - 1);
@@ -4121,24 +4124,20 @@ internalAllocateRAMClass(J9JavaVM *javaVM, J9ClassLoader *classLoader, RAMClassA
 	/* If any fragments remain unallocated, allocate a new segment to (at least) fit them */
 	if (fragmentsLeftToAllocate)
 	{
-		if(!isNotLoadedByAnonClassLoader)
-		{
-			for (request = requests; NULL != request; request = request->next) {
-				request->segmentKind = SUB4G;
-			}
-		}
 		memoryAllocationSuccess = allocateRemainingFragments(requests, allocationRequestCount, javaVM, classLoader, allocationRequests, &classLoader->sub4gBlock, classLoader->sub4gBlock.ramClassUDATABlockFreeList, SUB4G);
 		if(!memoryAllocationSuccess) {
 			return NULL;
 		}
-		memoryAllocationSuccess = allocateRemainingFragments(requests, allocationRequestCount, javaVM, classLoader, allocationRequests, &classLoader->frequentlyAccessedBlock, classLoader->frequentlyAccessedBlock.ramClassUDATABlockFreeList, FREQUENTLY_ACCESSED);
-		if(!memoryAllocationSuccess) {
-			return NULL;
-		}
-		memoryAllocationSuccess = allocateRemainingFragments(requests, allocationRequestCount, javaVM, classLoader, allocationRequests, &classLoader->inFrequentlyAccessedBlock, classLoader->inFrequentlyAccessedBlock.ramClassUDATABlockFreeList, INFREQUENTLY_ACCESSED);
+		if (isNotLoadedByAnonClassLoader) {
+			memoryAllocationSuccess = allocateRemainingFragments(requests, allocationRequestCount, javaVM, classLoader, allocationRequests, &classLoader->frequentlyAccessedBlock, classLoader->frequentlyAccessedBlock.ramClassUDATABlockFreeList, FREQUENTLY_ACCESSED);
+			if(!memoryAllocationSuccess) {
+				return NULL;
+			}
+			memoryAllocationSuccess = allocateRemainingFragments(requests, allocationRequestCount, javaVM, classLoader, allocationRequests, &classLoader->inFrequentlyAccessedBlock, classLoader->inFrequentlyAccessedBlock.ramClassUDATABlockFreeList, INFREQUENTLY_ACCESSED);
 
-		if(!memoryAllocationSuccess) {
-			return NULL;
+			if(!memoryAllocationSuccess) {
+				return NULL;
+			}
 		}
 	}
 	/* Clear all allocated fragments */
