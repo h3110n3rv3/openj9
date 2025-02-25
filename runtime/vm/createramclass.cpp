@@ -2941,7 +2941,7 @@ fail:
 			allocationRequests[RAM_INSTANCE_DESCRIPTION_FRAGMENT].alignment = sizeof(UDATA);
 			allocationRequests[RAM_INSTANCE_DESCRIPTION_FRAGMENT].alignedSize = instanceDescriptionSlotCount * sizeof(UDATA);
 			allocationRequests[RAM_INSTANCE_DESCRIPTION_FRAGMENT].address = NULL;
-			allocationRequests[RAM_INSTANCE_DESCRIPTION_FRAGMENT].segmentKind = SUB4G;
+			allocationRequests[RAM_INSTANCE_DESCRIPTION_FRAGMENT].segmentKind = INFREQUENTLY_ACCESSED;
 
 			/* iTable fragment */
 			allocationRequests[RAM_ITABLE_FRAGMENT].prefixSize = 0;
