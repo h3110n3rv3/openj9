@@ -2934,7 +2934,7 @@ fail:
 			}
 			allocationRequests[RAM_SUPERCLASSES_FRAGMENT].alignedSize = OMR_MAX(superclassSizeBytes, minimumSuperclassArraySizeBytes);
 			allocationRequests[RAM_SUPERCLASSES_FRAGMENT].address = NULL;
-			allocationRequests[RAM_SUPERCLASSES_FRAGMENT].segmentKind = SUB4G;
+			allocationRequests[RAM_SUPERCLASSES_FRAGMENT].segmentKind = INFREQUENTLY_ACCESSED;
 
 			/* instance description fragment */
 			allocationRequests[RAM_INSTANCE_DESCRIPTION_FRAGMENT].prefixSize = 0;
