@@ -2948,7 +2948,7 @@ fail:
 			allocationRequests[RAM_ITABLE_FRAGMENT].alignment = sizeof(UDATA);
 			allocationRequests[RAM_ITABLE_FRAGMENT].alignedSize = iTableSlotCount * sizeof(UDATA);
 			allocationRequests[RAM_ITABLE_FRAGMENT].address = NULL;
-			allocationRequests[RAM_ITABLE_FRAGMENT].segmentKind = SUB4G;
+			allocationRequests[RAM_ITABLE_FRAGMENT].segmentKind = INFREQUENTLY_ACCESSED;
 
 			/* static slots fragment */
 			allocationRequests[RAM_STATICS_FRAGMENT].prefixSize = 0;
