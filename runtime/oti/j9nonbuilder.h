@@ -298,15 +298,6 @@
 typedef void(*j9_tls_finalizer_t)(void *);
 #endif /* JAVA_SPEC_VERSION >= 19 */
 
-#if JAVA_SPEC_VERSION >= 24
-/* Constants from java.lang.VirutalThread.state that are used by the VM.
- * The full mapping is under jvmtiInternals.h <JVMTI_VTHREAD_STATE_*>.
- */
-#define JAVA_LANG_VIRTUALTHREAD_BLOCKING 12
-#define JAVA_LANG_VIRTUALTHREAD_WAITING  13
-#define JAVA_LANG_VIRTUALTHREAD_TIMED_WAITING 17
-#endif /* JAVA_SPEC_VERSION >= 24 */
-
 typedef enum {
 	J9FlushCompQueueDataBreakpoint
 } J9JITFlushCompilationQueueReason;
@@ -1715,11 +1706,6 @@ typedef struct J9ObjectMonitor {
 #endif /* defined(J9VM_THR_SMART_DEFLATION) */
 	j9objectmonitor_t alternateLockword;
 	U_32 hash;
-#if JAVA_SPEC_VERSION >= 24
-	U_32 virtualThreadWaitCount;
-	struct J9VMContinuation* ownerContinuation;
-	struct J9VMContinuation* waitingContinuations;
-#endif /* JAVA_SPEC_VERSION >= 24 */
 } J9ObjectMonitor;
 
 typedef struct J9ClassWalkState {
@@ -2445,23 +2431,25 @@ typedef struct J9ROMMethodHandleRef {
 #define MH_REF_INVOKEVIRTUAL  5
 #define MH_REF_PUTFIELD  3
 
-/* Constants mapped from java.lang.invoke.MethodHandleNatives$Constants
+/* Constants mapped from java.lang.invoke.MethodHandleNatives$Constants.
  * These constants are validated by the MethodHandleNatives$Constants.verifyConstants()
- * method when Java assertions are enabled
+ * method when Java assertions are enabled.
  */
-#define MN_IS_METHOD		0x00010000
-#define MN_IS_CONSTRUCTOR	0x00020000
-#define MN_IS_FIELD			0x00040000
-#define MN_IS_TYPE			0x00080000
-#define MN_CALLER_SENSITIVE	0x00100000
-#define MN_TRUSTED_FINAL	0x00200000
-#define MN_HIDDEN_MEMBER	0x00400000
+#define MN_IS_METHOD            0x00010000
+#define MN_IS_CONSTRUCTOR       0x00020000
+#define MN_IS_FIELD             0x00040000
+#define MN_IS_TYPE              0x00080000
+#define MN_CALLER_SENSITIVE     0x00100000
+#define MN_TRUSTED_FINAL        0x00200000
+#define MN_HIDDEN_MEMBER        0x00400000
 #if defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES)
-#define MN_NULL_RESTRICTED	0x00800000
+#define MN_NULL_RESTRICTED      0x00800000
 #endif /* defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES) */
-#define MN_REFERENCE_KIND_SHIFT	24
-/* (flag >> MN_REFERENCE_KIND_SHIFT) & MN_REFERENCE_KIND_MASK */
-#define MN_REFERENCE_KIND_MASK	(0x0F000000 >> MN_REFERENCE_KIND_SHIFT)
+#define MN_REFERENCE_KIND_SHIFT 24
+#define MN_REFERENCE_KIND_MASK  (0x0F000000 >> MN_REFERENCE_KIND_SHIFT)
+
+#define MN_GET_REFERENCE_KIND(flags) \
+	(((flags) >> MN_REFERENCE_KIND_SHIFT) & MN_REFERENCE_KIND_MASK)
 
 typedef struct J9ROMMethodRef {
 	U_32 classRefCPIndex;
@@ -3588,7 +3576,6 @@ typedef struct J9ArrayClass {
 	struct J9Class *companionArray;
 #endif /* defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES) */
 } J9ArrayClass;
-
 
 #if defined(LINUX) && defined(J9VM_ARCH_X86) && !defined(OSX)
 /* Only enable the assert on linux x86 as not all the versions
@@ -5336,10 +5323,6 @@ typedef struct J9InternalVMFunctions {
 	struct J9Class * (*initializeSnapshotClassObject)(struct J9JavaVM *javaVM, struct J9ClassLoader *classLoader, struct J9Class *clazz);
 	BOOLEAN (*loadWarmClassFromSnapshot)(struct J9VMThread *vmThread, struct J9ClassLoader *classLoader, struct J9Class *clazz);
 #endif /* defined(J9VM_OPT_SNAPSHOTS) */
-#if JAVA_SPEC_VERSION >= 24
-	struct J9ObjectMonitor * (*monitorTablePeek)(struct J9JavaVM *vm, j9object_t object);
-	jobject (*takeVirtualThreadListToUnblock)(struct J9VMThread *currentThread, struct J9JavaVM *vm);
-#endif /* JAVA_SPEC_VERSION >= 24 */
 } J9InternalVMFunctions;
 
 /* Jazz 99339: define a new structure to replace JavaVM so as to pass J9NativeLibrary to JVMTIEnv  */
@@ -5418,13 +5401,6 @@ typedef struct J9JITGPRSpillArea {
 typedef uintptr_t ContinuationState;
 
 #if JAVA_SPEC_VERSION >= 19
-#define J9VM_CONTINUATION_RETURN_FROM_YIELD 1
-#if JAVA_SPEC_VERSION >= 24
-#define J9VM_CONTINUATION_RETURN_FROM_MONITOR_ENTER 0
-#define J9VM_CONTINUATION_RETURN_FROM_OBJECT_WAIT   2
-#define J9VM_CONTINUATION_RETURN_FROM_SYNC_METHOD   3
-#endif /* JAVA_SPEC_VERSION >= 24 */
-
 typedef struct J9VMContinuation {
 	UDATA* arg0EA;
 	UDATA* bytecodes;
@@ -5440,16 +5416,6 @@ typedef struct J9VMContinuation {
 	struct J9I2JState i2jState;
 	struct J9VMEntryLocalStorage* oldEntryLocalStorage;
 	UDATA dropFlags;
-	UDATA returnState;
-#if JAVA_SPEC_VERSION >= 24
-	IDATA waitingMonitorEnterCount;
-	UDATA ownedMonitorCount;
-	struct J9Pool* monitorEnterRecordPool;
-	struct J9MonitorEnterRecord* monitorEnterRecords;
-	struct J9MonitorEnterRecord* jniMonitorEnterRecords;
-	j9object_t vthread;
-	struct J9VMContinuation* nextWaitingContinuation;
-#endif /* JAVA_SPEC_VERSION >= 24 */
 } J9VMContinuation;
 #endif /* JAVA_SPEC_VERSION >= 19 */
 
@@ -6369,10 +6335,6 @@ typedef struct J9JavaVM {
 #if defined(J9VM_OPT_JFR)
 	UDATA loadedClassCount;
 #endif /* defined(J9VM_OPT_JFR) */
-#if JAVA_SPEC_VERSION >= 24
-	J9VMContinuation *blockedContinuations;
-	omrthread_monitor_t blockedVirtualThreadsMutex;
-#endif /* JAVA_SPEC_VERSION >= 24 */
 } J9JavaVM;
 
 #define J9JFR_SAMPLER_STATE_UNINITIALIZED 0
@@ -6412,10 +6374,7 @@ typedef struct J9JavaVM {
 #if defined(J9VM_OPT_CRIU_SUPPORT)
 #define J9_OBJECT_MONITOR_CRIU_SINGLE_THREAD_MODE_THROW 2
 #endif /* defined(J9VM_OPT_CRIU_SUPPORT) */
-#if JAVA_SPEC_VERSION >= 24
-#define J9_OBJECT_MONITOR_YIELD_VIRTUAL 3
-#endif /* JAVA_SPEC_VERSION >= 24 */
-#define J9_OBJECT_MONITOR_BLOCKING 4
+#define J9_OBJECT_MONITOR_BLOCKING 3
 
 #if (JAVA_SPEC_VERSION >= 16) || defined(J9VM_OPT_CRIU_SUPPORT)
 #define J9_OBJECT_MONITOR_ENTER_FAILED(rc) ((UDATA)(rc) < J9_OBJECT_MONITOR_BLOCKING)
