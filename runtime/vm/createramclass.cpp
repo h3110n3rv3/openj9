@@ -2955,7 +2955,7 @@ fail:
 			allocationRequests[RAM_STATICS_FRAGMENT].alignment = sizeof(U_64);
 			allocationRequests[RAM_STATICS_FRAGMENT].alignedSize = totalStaticSlots * sizeof(UDATA);
 			allocationRequests[RAM_STATICS_FRAGMENT].address = NULL;
-			allocationRequests[RAM_STATICS_FRAGMENT].segmentKind = SUB4G;
+			allocationRequests[RAM_STATICS_FRAGMENT].segmentKind = INFREQUENTLY_ACCESSED;
 
 			/* constant pool fragment */
 			allocationRequests[RAM_CONSTANT_POOL_FRAGMENT].prefixSize = 0;
