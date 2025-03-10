@@ -178,9 +178,7 @@ retry:
 							clazz->classObject,
 							J9_JNI_UNWRAP_REFERENCE(protectionDomain));
 					}
-				} else
-#endif /* defined(J9VM_OPT_SNAPSHOTS) */
-				{
+				} else {
 					vmFuncs->setCurrentExceptionNLSWithArgs(
 						currentThread,
 						J9NLS_JCL_DUPLICATE_CLASS_DEFINITION,
@@ -188,6 +186,7 @@ retry:
 						utf8Length,
 						utf8Name);
 				}
+#endif /* defined(J9VM_OPT_SNAPSHOTS) */
 			}
 			goto done;
 		}
