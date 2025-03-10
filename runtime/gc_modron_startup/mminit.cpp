@@ -273,7 +273,7 @@ gcCleanupHeapStructures(J9JavaVM * vm)
 	if (NULL != gam) {
 		gam->flushAllocationContextsForShutdown(&env);
 	}
-
+#if defined(J9VM_OPT_SNAPSHOTS)
 	if (!IS_RESTORE_RUN(vm)) {
 		if (NULL != vm->memorySegments) {
 			vm->internalVMFunctions->freeMemorySegmentList(vm, vm->memorySegments);
@@ -283,7 +283,7 @@ gcCleanupHeapStructures(J9JavaVM * vm)
 			vm->internalVMFunctions->freeMemorySegmentList(vm, vm->classMemorySegments);
 		}
 	}
-
+#endif /* defined(J9VM_OPT_SNAPSHOTS) */
 #if defined(J9VM_GC_FINALIZATION)
 	if (extensions->finalizeListManager) {
 		extensions->finalizeListManager->kill(&env);
