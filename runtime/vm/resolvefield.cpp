@@ -561,9 +561,9 @@ freeHiddenInstanceFieldsList(J9JavaVM *vm)
 				VMSNAPSHOTIMPLPORT_ACCESS_FROM_JAVAVM(vm);
 				vmsnapshot_free_memory(field);
 			} else if (!IS_RESTORE_RUN(vm)) {
+#endif /* defined(J9VM_OPT_SNAPSHOTS) */
 				j9mem_free_memory(field);
 			}
-#endif /* defined(J9VM_OPT_SNAPSHOTS) */
 			field = next;
 		}
 		vm->hiddenInstanceFields = NULL;
