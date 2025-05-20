@@ -39,6 +39,9 @@
 #include "GCExtensions.hpp"
 #include "ModronTypes.hpp"
 
+#if JAVA_SPEC_VERSION >= 24
+class GC_ContinuationSlotIterator;
+#endif /* JAVA_SPEC_VERSION >= 24 */
 class GC_SlotObject;
 class MM_AllocationContextTarok;
 class MM_CardCleaner;
@@ -119,6 +122,7 @@ private:
 	uintptr_t _scanCacheListSize;	/**< The number of entries in _cacheScanLists */
 	volatile uintptr_t _scanCacheWaitCount;	/**< The number of threads currently sleeping on _scanCacheMonitor, awaiting scan cache work */
 	omrthread_monitor_t _scanCacheMonitor;	/**< Used when waiting on work on any of the _cacheScanLists */
+	omrthread_monitor_t _freeCacheMonitor; /**< Monitor to synchronize threads while resizing free list */
 
 	volatile uintptr_t *_workQueueWaitCountPtr;	/**< The number of threads currently sleeping on *_workQueueMonitorPtr, awaiting scan cache work or work from packets*/
 	omrthread_monitor_t *_workQueueMonitorPtr;	/**< Used when waiting on work on any of the _cacheScanLists or workPackets*/
@@ -318,9 +322,8 @@ private:
 	 * @param reservingContext[in] The context to which we would prefer to copy any objects discovered in this method
 	 * @param objectPtr current object being scanned.
 	 * @param reason to scan (dirty card, packet, scan cache, overflow)
-	 * @return true if all slots have been copied successfully
 	 */
-	bool scanMixedObjectSlots(MM_EnvironmentVLHGC *env, MM_AllocationContextTarok *reservingContext, J9Object *objectPtr, ScanReason reason);
+	void scanMixedObjectSlots(MM_EnvironmentVLHGC *env, MM_AllocationContextTarok *reservingContext, J9Object *objectPtr, ScanReason reason);
 	/**
 	 * Scan the slots of a reference mixed object.
 	 * Copy and forward all relevant slots values found in the object.
@@ -1129,6 +1132,11 @@ public:
 	}
 
 	void abandonTLHRemainders(MM_EnvironmentVLHGC *env);
+
+	MMINLINE void doSlot(MM_EnvironmentVLHGC *env, J9Object *fromObject, J9Object **slotPtr);
+#if JAVA_SPEC_VERSION >= 24
+	void doContinuationSlot(MM_EnvironmentVLHGC *env, J9Object *fromObject, J9Object **slotPtr, GC_ContinuationSlotIterator *continuationSlotIterator);
+#endif /* JAVA_SPEC_VERSION >= 24 */
 	void doStackSlot(MM_EnvironmentVLHGC *env, J9Object *fromObject, J9Object **slotPtr, J9StackWalkState *walkState, const void *stackLocation);
 
 	friend class MM_CopyForwardGMPCardCleaner;

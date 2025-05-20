@@ -48,6 +48,7 @@
 
 class GC_VMThreadIterator;
 class MM_ConcurrentGC;
+class MM_MarkingDelegate;
 class MM_MarkingScheme;
 
 /**
@@ -64,6 +65,7 @@ protected:
 	J9JavaVM *_javaVM;
 	GC_ObjectModel *_objectModel;
 	MM_ConcurrentGC *_collector;
+	MM_MarkingDelegate *_markingDelegate;
 	MM_MarkingScheme *_markingScheme;
 #if defined(J9VM_GC_DYNAMIC_CLASS_UNLOADING)
 	MM_ScanClassesMode _scanClassesMode; /** Support for dynamic class unloading in concurrent mark */
@@ -85,11 +87,6 @@ public:
 		, CONCURRENT_ROOT_TRACING3 = CONCURRENT_ROOT_TRACING + 3
 		, CONCURRENT_ROOT_TRACING4 = CONCURRENT_ROOT_TRACING + 4
 	};
-
-	typedef struct markSchemeStackIteratorData {
-		MM_MarkingScheme *markingScheme;
-		MM_EnvironmentBase *env;
-	} markSchemeStackIteratorData;
 
 	/*
 	 * Function members
@@ -364,6 +361,7 @@ public:
 		: _javaVM(NULL)
 		, _objectModel(NULL)
 		, _collector(NULL)
+		, _markingDelegate(NULL)
 		, _markingScheme(NULL)
 	{ }
 };

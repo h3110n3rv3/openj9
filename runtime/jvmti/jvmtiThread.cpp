@@ -403,21 +403,21 @@ jvmtiStopThread(jvmtiEnv *env,
 #if JAVA_SPEC_VERSION >= 21
 			j9object_t threadObject = (NULL == thread) ? currentThread->threadObject : J9_JNI_UNWRAP_REFERENCE(thread);
 
-			/* Error if a virtual thread is not suspended and not the current thread. */
-			if ((currentThread != targetThread)
-			&& (!VM_VMHelpers::isThreadSuspended(currentThread, threadObject))
-			&& IS_JAVA_LANG_VIRTUALTHREAD(currentThread, threadObject)
-			) {
-				rc = JVMTI_ERROR_THREAD_NOT_SUSPENDED;
-				goto release;
-			}
+			/* Error cases for a virtual thread that is not the current thread. */
+			if ((currentThread != targetThread) && IS_JAVA_LANG_VIRTUALTHREAD(currentThread, threadObject)) {
+				/* Error if a virtual thread is not suspended. */
+				if (!VM_VMHelpers::isThreadSuspended(currentThread, threadObject)) {
+					rc = JVMTI_ERROR_THREAD_NOT_SUSPENDED;
+					goto release;
+				}
 
-			/* Error if a virtual thread is unmounted since it won't be able to throw an
-			 * asynchronous exception from the current frame.
-			 */
-			if (NULL == targetThread) {
-				rc = JVMTI_ERROR_OPAQUE_FRAME;
-				goto release;
+				/* Error if a virtual thread is unmounted since it won't be able to throw an
+				 * asynchronous exception from the current frame.
+				 */
+				if (NULL == targetThread) {
+					rc = JVMTI_ERROR_OPAQUE_FRAME;
+					goto release;
+				}
 			}
 #endif /* JAVA_SPEC_VERSION >= 21 */
 			omrthread_monitor_enter(targetThread->publicFlagsMutex);
@@ -733,6 +733,7 @@ jvmtiGetOwnedMonitorInfo(jvmtiEnv *env,
 			vm->internalVMFunctions->haltThreadForInspection(currentThread, targetThread);
 
 #if JAVA_SPEC_VERSION >= 19
+			threadObject = (NULL == thread) ? currentThread->threadObject : J9_JNI_UNWRAP_REFERENCE(thread);
 			continuation = getJ9VMContinuationToWalk(currentThread, targetThread, threadObject);
 			if (NULL != continuation) {
 				memcpy(&stackThread, targetThread, sizeof(J9VMThread));
@@ -827,6 +828,7 @@ jvmtiGetOwnedMonitorStackDepthInfo(jvmtiEnv *env,
 			vm->internalVMFunctions->haltThreadForInspection(currentThread, targetThread);
 
 #if JAVA_SPEC_VERSION >= 19
+			threadObject = (NULL == thread) ? currentThread->threadObject : J9_JNI_UNWRAP_REFERENCE(thread);
 			continuation = getJ9VMContinuationToWalk(currentThread, targetThread, threadObject);
 			if (NULL != continuation) {
 				memcpy(&stackThread, targetThread, sizeof(J9VMThread));
@@ -926,8 +928,9 @@ jvmtiGetCurrentContendedMonitor(jvmtiEnv *env,
 	rc = getCurrentVMThread(vm, &currentThread);
 	if (JVMTI_ERROR_NONE == rc) {
 		J9VMThread *targetThread = NULL;
+		J9InternalVMFunctions const * const vmFuncs = vm->internalVMFunctions;
 
-		vm->internalVMFunctions->internalEnterVMFromJNI(currentThread);
+		vmFuncs->internalEnterVMFromJNI(currentThread);
 
 		ENSURE_PHASE_LIVE(env);
 		ENSURE_CAPABILITY(env, can_get_current_contended_monitor);
@@ -944,35 +947,51 @@ jvmtiGetCurrentContendedMonitor(jvmtiEnv *env,
 #if JAVA_SPEC_VERSION >= 19
 			j9object_t threadObject = (NULL == thread) ? currentThread->threadObject : J9_JNI_UNWRAP_REFERENCE(thread);
 
-			/* Unmounted VirtualThread and CarrierThread with VirtualThread mounted cannot be contended. */
-			if (((NULL == targetThread) && IS_JAVA_LANG_VIRTUALTHREAD(currentThread, threadObject))
-			|| ((NULL != targetThread) && (threadObject == targetThread->carrierThreadObject) && (NULL != targetThread->currentContinuation))
-			) {
+			if ((NULL == targetThread) && IS_JAVA_LANG_VIRTUALTHREAD(currentThread, threadObject)) {
+#if JAVA_SPEC_VERSION >= 24
+				j9object_t continuationObject = J9VMJAVALANGVIRTUALTHREAD_CONT(currentThread, threadObject);
+
+				if (NULL != continuationObject) {
+					j9object_t syncObject = J9VMJDKINTERNALVMCONTINUATION_BLOCKER(currentThread, continuationObject);
+
+					/* Check if the Continuation.blocker field is set. */
+					if (NULL != syncObject) {
+						U_32 state = J9VMJAVALANGVIRTUALTHREAD_STATE(currentThread, threadObject);
+						if ((JVMTI_VTHREAD_STATE_BLOCKING == state) || (JVMTI_VTHREAD_STATE_BLOCKED == state)) {
+							rv_monitor = (jobject)vmFuncs->j9jni_createLocalRef((JNIEnv *)currentThread, syncObject);
+						}
+					}
+				}
+#endif /* JAVA_SPEC_VERSION >= 24 */
+				/* Prior to JDK24, an unmounted VirtualThread cannot be contended. */
+				goto release;
+			} else if ((NULL != targetThread) && (threadObject == targetThread->carrierThreadObject) && (NULL != targetThread->currentContinuation)) {
+				/* CarrierThread with VirtualThread mounted cannot be contended. */
 				goto release;
 			}
 #endif /* JAVA_SPEC_VERSION >= 19 */
 
 			/* CMVC 184481 - The targetThread should be suspended while we attempt to get its state. */
-			vm->internalVMFunctions->haltThreadForInspection(currentThread, targetThread);
+			vmFuncs->haltThreadForInspection(currentThread, targetThread);
 
 			vmstate = getVMThreadObjectStatesAll(targetThread, &lockObject, NULL, NULL);
 
 			if ((NULL != lockObject)
 			&& (OMR_ARE_NO_BITS_SET(vmstate, J9VMTHREAD_STATE_PARKED | J9VMTHREAD_STATE_PARKED_TIMED))
 			) {
-				rv_monitor = (jobject)vm->internalVMFunctions->j9jni_createLocalRef((JNIEnv *)currentThread, lockObject);
+				rv_monitor = (jobject)vmFuncs->j9jni_createLocalRef((JNIEnv *)currentThread, lockObject);
 			} else {
 				rv_monitor = NULL;
 			}
 
-			vm->internalVMFunctions->resumeThreadForInspection(currentThread, targetThread);
+			vmFuncs->resumeThreadForInspection(currentThread, targetThread);
 #if JAVA_SPEC_VERSION >= 19
 release:
 #endif /* JAVA_SPEC_VERSION >= 19 */
 			releaseVMThread(currentThread, targetThread, thread);
 		}
 done:
-		vm->internalVMFunctions->internalExitVMToJNI(currentThread);
+		vmFuncs->internalExitVMToJNI(currentThread);
 	}
 
 	if (NULL != monitor_ptr) {

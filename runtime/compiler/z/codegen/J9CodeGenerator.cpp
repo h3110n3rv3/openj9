@@ -87,8 +87,9 @@ J9::Z::CodeGenerator::initialize()
    if (cg->getSupportsVectorRegisters() && !comp->getOption(TR_DisableSIMDStringCaseConv))
       cg->setSupportsInlineStringCaseConversion();
 
-   if (cg->getSupportsVectorRegisters() && !comp->getOption(TR_DisableFastStringIndexOf) &&
-       !TR::Compiler->om.canGenerateArraylets() && !TR::Compiler->om.isOffHeapAllocationEnabled())
+   if (cg->getSupportsVectorRegisters()
+         && !comp->getOption(TR_DisableFastStringIndexOf)
+         && !TR::Compiler->om.canGenerateArraylets())
       {
       cg->setSupportsInlineStringIndexOf();
       }
@@ -264,9 +265,19 @@ J9::Z::CodeGenerator::initialize()
       }
 
    static bool disableIntegerToChars = (feGetEnv("TR_DisableIntegerToChars") != NULL);
-   if (cg->getSupportsVectorRegisters() && !TR::Compiler->om.canGenerateArraylets() && !TR::Compiler->om.isOffHeapAllocationEnabled() && !disableIntegerToChars && comp->target().cpu.isAtLeast(OMR_PROCESSOR_S390_Z16))
+   if (cg->getSupportsVectorRegisters()
+       && comp->target().cpu.isAtLeast(OMR_PROCESSOR_S390_Z16)
+       && !disableIntegerToChars
+       && !TR::Compiler->om.canGenerateArraylets())
       {
       cg->setSupportsIntegerToChars();
+      }
+
+   static bool disableIntegerStringSize = (feGetEnv("TR_DisableIntegerStringSize") != NULL);
+   if (cg->getSupportsVectorRegisters()
+       && comp->target().cpu.isAtLeast(OMR_PROCESSOR_S390_Z16)
+       && !disableIntegerStringSize)
+      {
       cg->setSupportsIntegerStringSize();
       }
 
@@ -3761,8 +3772,8 @@ J9::Z::CodeGenerator::suppressInliningOfRecognizedMethod(TR::RecognizedMethod me
       return true;
       }
 
-   static bool disableZNextCompressExpand = feGetEnv("TR_DisableZNextCompressExpand") != NULL;
-   if (!disableZNextCompressExpand &&
+   static bool disableZ17CompressExpand = feGetEnv("TR_DisableZ17CompressExpand") != NULL;
+   if (!disableZ17CompressExpand &&
        (self()->comp()->target().cpu.supportsFeature(OMR_FEATURE_S390_MISCELLANEOUS_INSTRUCTION_EXTENSION_4) ||
         TR::InstOpCode(TR::InstOpCode::BEXTG).canEmulate() && TR::InstOpCode(TR::InstOpCode::BDEPG).canEmulate()))
       {
@@ -4157,8 +4168,8 @@ J9::Z::CodeGenerator::inlineDirectCall(
          break;
       }
 
-   static bool disableZNextCompressExpand = feGetEnv("TR_DisableZNextCompressExpand") != NULL;
-   if (!disableZNextCompressExpand &&
+   static bool disableZ17CompressExpand = feGetEnv("TR_DisableZ17CompressExpand") != NULL;
+   if (!disableZ17CompressExpand &&
        (self()->comp()->target().cpu.supportsFeature(OMR_FEATURE_S390_MISCELLANEOUS_INSTRUCTION_EXTENSION_4) ||
         TR::InstOpCode(TR::InstOpCode::BEXTG).canEmulate() && TR::InstOpCode(TR::InstOpCode::BDEPG).canEmulate()))
       {

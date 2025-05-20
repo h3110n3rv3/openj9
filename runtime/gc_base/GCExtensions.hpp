@@ -201,6 +201,8 @@ public:
 
 	bool tlhMaximumSizeSpecified; /**< true, if tlhMaximumSize specified by a command line option */
 
+	MM_UserSpecifiedParameterBool virtualLargeObjectHeap; /**< off heap option */
+
 	bool dynamicHeapAdjustmentForRestore; /**< If set to true, the default heuristic-calculated softmx is prioritized over the user-specified values. */
 	/**
 	 * Values for com.ibm.oti.vm.VM.J9_JIT_STRING_DEDUP_POLICY
@@ -246,6 +248,7 @@ public:
 	TimingAddContinuationInList timingAddContinuationInList;
 	bool testContainerMemLimit; /**< if set simulates a container with memory limit set - for GC testing only*/
 	double testRAMSizePercentage; /**< a percentage to increase/decrease usablePhysicalMemory - for GC testing only, only applies to CRIU restore VM */
+	bool enableOriginalJDK8HeapSizeCompatibilityOption; /**< if set use JDK8 heap size default */
 protected:
 private:
 protected:
@@ -427,6 +430,7 @@ public:
 		, numaCommonThreadClassNamePatterns(NULL)
 		, userSpecifiedParameters()
 		, tlhMaximumSizeSpecified(false)
+		, virtualLargeObjectHeap()
 		, dynamicHeapAdjustmentForRestore(false)
 		, stringDedupPolicy(J9_JIT_STRING_DEDUP_POLICY_UNDEFINED)
 		, _asyncCallbackKey(-1)
@@ -446,6 +450,7 @@ public:
 		, timingAddContinuationInList(onCreated)
 		, testContainerMemLimit(false)
 		, testRAMSizePercentage(-1.0)
+		, enableOriginalJDK8HeapSizeCompatibilityOption(false)
 	{
 		_typeId = __FUNCTION__;
 	}

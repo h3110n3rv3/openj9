@@ -480,10 +480,25 @@ int32_t TR::CompilationInfo::computeDynamicDumbInlinerBytecodeSizeCutoff(TR::Opt
 TR_YesNoMaybe TR::CompilationInfo::shouldActivateNewCompThread()
    {
 #if defined(J9VM_OPT_CRIU_SUPPORT)
-   // Don't activate any threads until the restore if the threads should be suspended for checkpoint
+   // Only allow a single comp thread pre-checkpoint if -XX:+DebugOnRestore
+   // is specified. This prevents carving up more code caches than needed
+   // which reduces the RSS footprint. However, this does will increase the
+   // time to checkpoint, which may impact scenarios where the checkpoint is
+   // part of the runtime and not part of the container image build process.
+   J9JavaVM *javaVM = getJITConfig()->javaVM;
+   if (getNumCompThreadsActive() > 0
+       && javaVM->internalVMFunctions->isDebugOnRestoreEnabled(javaVM)
+       && javaVM->internalVMFunctions->isCheckpointAllowed(javaVM))
+      {
+      return TR_no;
+      }
+
+   // Don't activate any threads until the restore if the threads should be
+   // suspended for checkpoint
    if (getCRRuntime()->shouldSuspendThreadsForCheckpoint())
       return TR_no;
 #endif
+
    if (isInShutdownMode())
       return TR_no;
 
@@ -2273,6 +2288,7 @@ bool TR::CompilationInfo::shouldRetryCompilation(J9VMThread *vmThread, TR_Method
             case compilationAOTNoSupportForAOTFailure:
             case compilationAOTRelocationRecordGenerationFailure:
             case compilationRelocationFailure:
+            case compilationAOTThunkPersistenceFailure:
                // switch to JIT for these cases (we don't want to relocate again)
                entry->_doNotAOTCompile = true;
                tryCompilingAgain = true;
@@ -2769,7 +2785,7 @@ void TR::CompilationInfo::resumeCompilationThread()
       TR_ASSERT(curCompThreadInfoPT, "a thread's compinfo is missing\n");
 
       TR_YesNoMaybe activate = shouldActivateNewCompThread();
-      if (activate == TR_no)
+      if (activate == TR_no || (activate == TR_maybe && _queueWeight == 0))
          break;
 
       curCompThreadInfoPT->resumeCompilationThread();
@@ -3388,13 +3404,13 @@ void TR::CompilationInfo::stopCompilationThreads()
    static char * printCCUsage = feGetEnv("TR_PrintCodeCacheUsage");
 
    // Example:
-   // CodeCache: size=262144Kb used=2048Kb max_used=1079Kb free=260096Kb
+   // CodeCache: size=262144kB used=2048kB max_used=1079kB free=260096kB
    if (TR::Options::getCmdLineOptions()->getOption(TR_PrintCodeCacheUsage) || printCompMem || printCCUsage)
       {
-      unsigned long currTotalUsedKB = (unsigned long)(TR::CodeCacheManager::instance()->getCurrTotalUsedInBytes()/1024);
-      unsigned long maxUsedKB = (unsigned long)(TR::CodeCacheManager::instance()->getMaxUsedInBytes()/1024);
+      size_t currTotalUsedKB = TR::CodeCacheManager::instance()->getCurrTotalUsedInBytes() / 1024;
+      size_t maxUsedKB = TR::CodeCacheManager::instance()->getMaxUsedInBytes() / 1024;
 
-      fprintf(stderr, "\nCodeCache: size=%" OMR_PRIuPTR "Kb used=%luKb max_used=%luKb free=%" OMR_PRIuPTR "Kb\n\n",
+      fprintf(stderr, "\nCodeCache: size=%" OMR_PRIuPTR "kB used=%" OMR_PRIuSIZE "kB max_used=%" OMR_PRIuSIZE "kB free=%" OMR_PRIuSIZE "kB\n\n",
               _jitConfig->codeCacheTotalKB,
               currTotalUsedKB,
               maxUsedKB,
@@ -7121,10 +7137,10 @@ TR::CompilationInfoPerThreadBase::generatePerfToolEntry()
       {
       firstAttempt = false;
       uintptr_t jvmPid = getCompilation()->fej9()->getProcessID();
-      static const int maxPerfFilenameSize = 15 + sizeof(jvmPid)* 3; // "/tmp/perf-%ld.map"
+      static const int maxPerfFilenameSize = 15 + sizeof(jvmPid) * 3; // "/tmp/perf-%lu.map"
       char perfFilename[maxPerfFilenameSize] = { 0 };
 
-      bool truncated = TR::snprintfTrunc(perfFilename, maxPerfFilenameSize, "/tmp/perf-%ld.map", jvmPid);
+      bool truncated = TR::snprintfTrunc(perfFilename, maxPerfFilenameSize, "/tmp/perf-%" OMR_PRIuPTR ".map", jvmPid);
       if (!truncated)
          {
          TR::CompilationInfoPerThreadBase::_perfFile = j9jit_fopen(perfFilename, "a", true);
@@ -11435,6 +11451,10 @@ TR::CompilationInfoPerThreadBase::processException(
    catch (const J9::AOTRelocationRecordGenerationFailure &e)
       {
       _methodBeingCompiled->_compErrCode = compilationAOTRelocationRecordGenerationFailure;
+      }
+   catch (const J9::AOTThunkPersistenceFailure &e)
+      {
+      _methodBeingCompiled->_compErrCode = compilationAOTThunkPersistenceFailure;
       }
    catch (const J9::ClassChainPersistenceFailure &e)
       {

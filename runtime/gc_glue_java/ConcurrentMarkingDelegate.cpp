@@ -35,33 +35,7 @@
 #include "VMInterface.hpp"
 #include "VMThreadListIterator.hpp"
 
-/**
- * Concurrents stack slot iterator.
- * Called for each slot in a threads active stack frames which contains a object reference.
- *
- * @param objectIndirect
- * @param localdata
- * @param isDerivedPointer
- * @param objectIndirectBase
- */
-void
-concurrentStackSlotIterator(J9JavaVM *javaVM, omrobjectptr_t *objectIndirect, void *localData, J9StackWalkState *walkState, const void *stackLocation)
-{
-	MM_ConcurrentMarkingDelegate::markSchemeStackIteratorData *data = (MM_ConcurrentMarkingDelegate::markSchemeStackIteratorData *)localData;
-
-	omrobjectptr_t object = *objectIndirect;
-	if (data->env->getExtensions()->heap->objectIsInGap(object)) {
-		/* CMVC 136483:  Ensure that the object is not in the gap of a split heap (stack-allocated object) since we can't mark that part of the address space */
-		Assert_MM_validStackSlot(MM_StackSlotValidator(MM_StackSlotValidator::NOT_ON_HEAP, object, stackLocation, walkState).validate(data->env));
-	} else if (data->markingScheme->isHeapObject(object)) {
-		/* heap object - validate and mark */
-		Assert_MM_validStackSlot(MM_StackSlotValidator(0, object, stackLocation, walkState).validate(data->env));
-		data->markingScheme->markObject(data->env, object);
-	} else if (NULL != object) {
-		/* stack object - just validate */
-		Assert_MM_validStackSlot(MM_StackSlotValidator(MM_StackSlotValidator::NOT_ON_HEAP, object, stackLocation, walkState).validate(data->env));
-	}
-}
+#include "MarkingDelegate.hpp"
 
 bool
 MM_ConcurrentMarkingDelegate::initialize(MM_EnvironmentBase *env, MM_ConcurrentGC *collector)
@@ -70,6 +44,7 @@ MM_ConcurrentMarkingDelegate::initialize(MM_EnvironmentBase *env, MM_ConcurrentG
 	_javaVM = (J9JavaVM *)extensions->getOmrVM()->_language_vm;
 	_objectModel = &(extensions->objectModel);
 	_markingScheme = collector->getMarkingScheme();
+	_markingDelegate = _markingScheme->getMarkingDelegate();
 	_collector = collector;
 	return true;
 }
@@ -149,15 +124,13 @@ MM_ConcurrentMarkingDelegate::scanThreadRoots(MM_EnvironmentBase *env)
 		}
 	}
 
-	markSchemeStackIteratorData localData;
-	localData.markingScheme = _markingScheme;
-	localData.env = env;
-	/* In a case this thread is a carrier thread, and a virtual thread is mounted, we will scan virtual thread's stack. */
-	GC_VMThreadStackSlotIterator::scanSlots(vmThread, vmThread, (void *)&localData, concurrentStackSlotIterator, true, false);
+	MM_MarkingDelegate::StackIteratorData localData(env, _markingDelegate);
+	const bool stackFrameClassWalkNeeded = true;
+	GC_VMThreadStackSlotIterator::scanSlots(vmThread, vmThread, (void *)&localData, (J9MODRON_OSLOTITERATOR *)MM_MarkingDelegate::stackSlotIterator, stackFrameClassWalkNeeded, false);
 
 #if JAVA_SPEC_VERSION >= 19
 	if (NULL != vmThread->currentContinuation) {
-		GC_VMThreadStackSlotIterator::scanSlots(vmThread, vmThread, vmThread->currentContinuation, (void *)&localData, concurrentStackSlotIterator, true, false);
+		_markingDelegate->scanContinuationNativeSlotsNoSync(env, vmThread, vmThread->currentContinuation, stackFrameClassWalkNeeded);
 	}
 #endif /* JAVA_SPEC_VERSION >= 19 */
 

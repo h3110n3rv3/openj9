@@ -35,6 +35,9 @@
 
 #include "BaseVirtual.hpp"
 
+#if JAVA_SPEC_VERSION >= 24
+#include "ContinuationSlotIterator.hpp"
+#endif /* JAVA_SPEC_VERSION >= 24 */
 #include "EnvironmentBase.hpp"
 #include "GCExtensions.hpp"
 #include "JVMTIObjectTagTableIterator.hpp"
@@ -570,29 +573,6 @@ public:
 	virtual void doObjectInVirtualLargeObjectHeap(J9Object *objectPtr, bool *sparseHeapAllocation);
 #endif /* defined(J9VM_GC_SPARSE_HEAP_ALLOCATION) */
 	
-#if defined(J9VM_ENV_DATA64)
-	/**
-	 * Check if data is adjacent to array header, based on dataAddr value.
-	 * This is used during stack slots scanning, when object can move.
-	 * It is called after the object movement (stack slot has been fixed,
-	 * although copying operation may not be necessarily completed yet).
-	 * Specific RootScanner that can move objects will use either src or dst to perform adjacency check,
-	 * whichever is safe. Scanners that not move objects should not be calling it, otherwise will assert.
-	 * Should really be called only for Offheap and only for contiguous arrays (non-zero sized objects),
-	 * although that is not asserted.
-	 *
-	 * @param src array address before movement
-	 * @param dst array address after movement
-	 *
-	 * @return true if data is next to the header, and false if its in Offheap
-	 */
-
-	virtual bool isDataAdjacentToHeader(J9IndexableObject *src, J9IndexableObject *dst) {
-		Assert_MM_unreachable();
-		return true;
-	}
-#endif /* defined(J9VM_ENV_DATA64) */
-
 #if defined(J9VM_GC_ENABLE_DOUBLE_MAP)
 	/**
 	 * Frees double mapped region associated to objectPtr (arraylet spine) if objectPtr
@@ -604,6 +584,10 @@ public:
 	 */
 	virtual void doDoubleMappedObjectSlot(J9Object *objectPtr, struct J9PortVmemIdentifier *identifier);
 #endif /* J9VM_GC_ENABLE_DOUBLE_MAP */
+
+#if JAVA_SPEC_VERSION >= 24
+	virtual void doContinuationSlot(J9Object **slotPtr, GC_ContinuationSlotIterator *continuationSlotIterator);
+#endif /* JAVA_SPEC_VERSION >= 24 */
 
 	/**
 	 * Called for each object stack slot. Subclasses may override.

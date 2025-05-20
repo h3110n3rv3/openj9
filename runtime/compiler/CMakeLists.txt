@@ -263,6 +263,10 @@ if(OMR_OS_LINUX OR OMR_OS_OSX)
 		-fno-threadsafe-statics
 		-Wno-invalid-offsetof
 	)
+	if(OMR_ENV_DATA32)
+		# avoid memset warnings, for warnings as errors
+		list(APPEND J9_CXXFLAGS -Wno-stringop-overflow)
+	endif()
 	if(NOT J9VM_OPT_JITSERVER)
 		list(APPEND J9_CXXFLAGS -fno-rtti)
 	endif()
@@ -284,7 +288,7 @@ elseif(OMR_OS_AIX)
 		-DSUPPORTS_THREAD_LOCAL
 	)
 	if(OMR_ENV_DATA64)
-		if(OMR_TOOLCONFIG STREQUAL "openxl")
+		if(CMAKE_C_COMPILER_IS_OPENXL)
 			list(APPEND J9_SHAREDFLAGS -m64)
 		else()
 			list(APPEND J9_SHAREDFLAGS -q64)
@@ -399,7 +403,7 @@ set_source_files_properties(
 
 if(OMR_OS_LINUX)
 	set_property(TARGET j9jit APPEND_STRING PROPERTY
-		LINK_FLAGS " -Wl,-z,noexecstack -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/build/scripts/j9jit.linux.exp")
+		LINK_FLAGS " -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/build/scripts/j9jit.linux.exp")
 	target_link_libraries(j9jit PRIVATE m)
 elseif(OMR_OS_WINDOWS)
 	target_sources(j9jit PRIVATE build/scripts/j9jit.def)

@@ -23,13 +23,18 @@
 #ifndef JITSERVER_IPROFILER_HPP
 #define JITSERVER_IPROFILER_HPP
 
+#include "control/JITServerHelpers.hpp"
 #include "runtime/IProfiler.hpp"
 
 namespace JITServer
 {
 class ClientStream;
 }
-
+namespace TR
+{
+class CompilationInfoPerThreadRemote;
+}
+class ClientSessionData;
 struct TR_ContiguousIPMethodData
    {
    TR_OpaqueMethodBlock *_method;
@@ -101,8 +106,11 @@ public:
 
    virtual void persistIprofileInfo(TR::ResolvedMethodSymbol *methodSymbol, TR_ResolvedMethod *method, TR::Compilation *comp) override;
 
-   TR_IPBytecodeHashTableEntry *ipBytecodeHashTableEntryFactory(TR_IPBCDataStorageHeader *storage, uintptr_t pc, TR_Memory* mem, TR_AllocationKind allocKind);
+   static TR_IPBytecodeHashTableEntry *ipBytecodeHashTableEntryFactory(TR_IPBCDataStorageHeader *storage, uintptr_t pc, TR_Memory* mem, TR_AllocationKind allocKind);
+   // This is used for fanin data
    TR_IPMethodHashTableEntry *deserializeMethodEntry(TR_ContiguousIPMethodHashTableEntry *serialEntry, TR_Memory *trMemory);
+   // This is used for bytecode profile data
+   static void deserializeIProfilerData(J9Method *method, const std::string &ipdata, Vector<TR_IPBytecodeHashTableEntry *> &ipEntries, TR_Memory *trMemory, bool cgEntriesOnly = false);
    void printStats();
 
 protected:
@@ -110,6 +118,8 @@ protected:
 
 private:
    void validateCachedIPEntry(TR_IPBytecodeHashTableEntry *entry, TR_IPBCDataStorageHeader *clientData, uintptr_t methodStart, bool isMethodBeingCompiled, TR_OpaqueMethodBlock *method, bool fromPerCompilationCache, bool isCompiledWhenProfiling);
+   bool cacheProfilingDataForMethod(TR_OpaqueMethodBlock *method, const std::string &ipdata, bool usePersistentCache, ClientSessionData *clientSessionData,
+                                    TR::CompilationInfoPerThreadRemote *compInfoPT, bool isCompiled, TR::Compilation *comp);
    bool _useCaching;
    // Statistics
    uint32_t _statsIProfilerInfoFromCache;  // IP cache answered the query
@@ -139,13 +149,20 @@ public:
    // Thus, any virtual function here must call the corresponding method in
    // the base class. It may be better not to override any methods though
 
-   bool serializeAndSendIProfileInfoForMethod(TR_OpaqueMethodBlock*method, TR::Compilation *comp, JITServer::ClientStream *client, bool usePersistentCache, bool isCompiled);
+   bool serializeAndSendIProfileInfoForMethod(TR_OpaqueMethodBlock*method, TR::Compilation *comp, JITServer::ClientStream *client,
+                                              bool usePersistentCache, bool isCompiled, bool sharedProfile);
    std::string serializeIProfilerMethodEntry(TR_OpaqueMethodBlock *omb);
-
+   void gatherUncachedClassesUsedInCGEntry(TR_IPBCDataCallGraph *cgEntry, TR::Compilation *comp,
+                                           std::vector<J9Class *> &uncachedClasses,
+                                           std::vector<JITServerHelpers::ClassInfoTuple> &classInfos);
 private:
    uint32_t walkILTreeForIProfilingEntries(uintptr_t *pcEntries, uint32_t &numEntries, TR_J9ByteCodeIterator *bcIterator,
                                            TR_OpaqueMethodBlock *method, TR_BitVector *BCvisit, bool &abort, TR::Compilation *comp);
-   uintptr_t serializeIProfilerMethodEntries(uintptr_t *pcEntries, uint32_t numEntries, uintptr_t memChunk, uintptr_t methodStartAddress);
+   uintptr_t serializeIProfilerMethodEntries(const uintptr_t *pcEntries, uint32_t numEntries,
+                                             uintptr_t memChunk, uintptr_t methodStartAddress,
+                                             TR::Compilation *comp, bool sharedProfile, uint64_t &totalSamples,
+                                             std::vector<J9Class *> &uncachedClasses,
+                                             std::vector<JITServerHelpers::ClassInfoTuple> &classInfos);
    };
 
 #endif

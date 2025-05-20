@@ -177,7 +177,7 @@ areJFRBuffersReadyForWrite(J9VMThread *currentThread)
  * @returns true on success, false on failure
  */
 static bool
-writeOutGlobalBuffer(J9VMThread *currentThread, bool finalWrite)
+writeOutGlobalBuffer(J9VMThread *currentThread, bool finalWrite, bool dumpCalled)
 {
 	J9JavaVM *vm = currentThread->javaVM;
 
@@ -186,8 +186,8 @@ writeOutGlobalBuffer(J9VMThread *currentThread, bool finalWrite)
 	j9tty_printf(PORTLIB, "\n!!! writing global buffer %p of size %p\n", currentThread, vm->jfrBuffer.bufferSize - vm->jfrBuffer.bufferRemaining);
 #endif /* defined(DEBUG) */
 
-	if (areJFRBuffersReadyForWrite(currentThread)) {
-		VM_JFRWriter::flushJFRDataToFile(currentThread, finalWrite);
+	if (vm->jfrState.isStarted && (NULL != vm->jfrBuffer.bufferCurrent)) {
+		VM_JFRWriter::flushJFRDataToFile(currentThread, finalWrite, dumpCalled);
 
 		/* Reset the buffer */
 		vm->jfrBuffer.bufferRemaining = vm->jfrBuffer.bufferSize;
@@ -209,7 +209,7 @@ writeOutGlobalBuffer(J9VMThread *currentThread, bool finalWrite)
  * paused (e.g. by exclusive VM access).
  *
  * @param currentThread[in] the current J9VMThread
- * @param flushThread[in] the J9VMThread to fluah
+ * @param flushThread[in] the J9VMThread to flush
  *
  * @returns true on success, false on failure
  */
@@ -231,7 +231,7 @@ flushBufferToGlobal(J9VMThread *currentThread, J9VMThread *flushThread)
 
 	omrthread_monitor_enter(vm->jfrBufferMutex);
 	if (vm->jfrBuffer.bufferRemaining < bufferSize) {
-		if (!writeOutGlobalBuffer(currentThread, false)) {
+		if (!writeOutGlobalBuffer(currentThread, false, false)) {
 			omrthread_monitor_exit(vm->jfrBufferMutex);
 			success = false;
 			goto done;
@@ -442,7 +442,7 @@ jfrClassesUnload(J9HookInterface **hook, UDATA eventNum, void *eventData, void *
 	 * invalid, so write out all of the available data now.
 	 */
 	flushAllThreadBuffers(currentThread, false);
-	writeOutGlobalBuffer(currentThread, false);
+	writeOutGlobalBuffer(currentThread, false, false);
 }
 
 /**
@@ -477,7 +477,7 @@ jfrVMShutdown(J9HookInterface **hook, UDATA eventNum, void *eventData, void *use
 
 	/* Flush and free all the thread buffers and write out the global buffer */
 	flushAllThreadBuffers(currentThread, true);
-	writeOutGlobalBuffer(currentThread, true);
+	writeOutGlobalBuffer(currentThread, true, true);
 
 	if (acquiredExclusive) {
 		releaseExclusiveVMAccess(currentThread);
@@ -544,7 +544,7 @@ jfrThreadEnd(J9HookInterface **hook, UDATA eventNum, void *eventData, void *user
 	PORT_ACCESS_FROM_VMC(currentThread);
 	acquireExclusiveVMAccess(currentThread);
 	flushAllThreadBuffers(currentThread, false);
-	writeOutGlobalBuffer(currentThread, false);
+	writeOutGlobalBuffer(currentThread, false, false);
 
 	/* Free the thread local buffer */
 	j9mem_free_memory((void*)currentThread->jfrBuffer.bufferStart);
@@ -679,6 +679,7 @@ jfrVMMonitorEntered(J9HookInterface **hook, UDATA eventNum, void *eventData, voi
 		jfrEvent->duration = j9time_nano_time() - event->startTicks;
 		jfrEvent->monitorClass = event->monitorClass;
 		jfrEvent->monitorAddress = (UDATA)event->monitor;
+		jfrEvent->previousOwner = event->previousOwner;
 	}
 }
 
@@ -704,10 +705,12 @@ jfrVMThreadParked(J9HookInterface **hook, UDATA eventNum, void *eventData, void*
 	J9JFRThreadParked *jfrEvent = (J9JFRThreadParked*)reserveBufferWithStackTrace(currentThread, currentThread, J9JFR_EVENT_TYPE_THREAD_PARK, sizeof(*jfrEvent));
 	if (NULL != jfrEvent) {
 		// TODO: worry about overflow?
-		jfrEvent->time = (event->millis * 1000000) + event->nanos;
-		jfrEvent->duration = j9time_nano_time() - event->startTicks;
-		jfrEvent->parkedAddress = event->parkedAddress;
+		I_64 currentTime = j9time_nano_time();
+		jfrEvent->duration = currentTime - event->startTicks;
 		jfrEvent->parkedClass = event->parkedClass;
+		jfrEvent->timeOut = (event->millis * 1000000) + event->nanos;
+		jfrEvent->untilTime = currentTime;
+		jfrEvent->parkedAddress = event->parkedAddress;
 	}
 }
 
@@ -1192,7 +1195,7 @@ jfrDump(J9VMThread *currentThread, BOOLEAN finalWrite)
 {
 	/* Flush all the thread buffers and write out the global buffer. */
 	flushAllThreadBuffers(currentThread, finalWrite);
-	writeOutGlobalBuffer(currentThread, finalWrite);
+	writeOutGlobalBuffer(currentThread, finalWrite, true);
 }
 
 static UDATA
@@ -1283,7 +1286,7 @@ getTypeIdUTF8(J9VMThread *currentThread, const J9UTF8 *className)
 	Trc_VM_getTypeIdUTF8_Entry(currentThread, J9UTF8_LENGTH(className), J9UTF8_DATA(className));
 
 	omrthread_monitor_enter(vm->classTableMutex);
-	J9Class *clazz = hashClassTableAt(vm->systemClassLoader, J9UTF8_DATA(className), J9UTF8_LENGTH(className));
+	J9Class *clazz = hashClassTableAt(vm->systemClassLoader, (U_8 *)J9UTF8_DATA(className), J9UTF8_LENGTH(className));
 	omrthread_monitor_exit(vm->classTableMutex);
 
 	if (NULL != clazz) {

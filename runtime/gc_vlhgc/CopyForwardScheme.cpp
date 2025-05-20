@@ -51,6 +51,9 @@
 #include "CompactGroupManager.hpp"
 #include "CompactGroupPersistentStats.hpp"
 #include "CompressedCardTable.hpp"
+#if JAVA_SPEC_VERSION >= 24
+#include "ContinuationSlotIterator.hpp"
+#endif /* JAVA_SPEC_VERSION >= 24 */
 #include "CopyForwardCompactGroup.hpp"
 #include "CopyForwardGMPCardCleaner.hpp"
 #include "CopyForwardNoGMPCardCleaner.hpp"
@@ -161,6 +164,7 @@ MM_CopyForwardScheme::MM_CopyForwardScheme(MM_EnvironmentVLHGC *env, MM_HeapRegi
 	, _scanCacheListSize(_extensions->_numaManager.getMaximumNodeNumber() + 1)
 	, _scanCacheWaitCount(0)
 	, _scanCacheMonitor(NULL)
+	, _freeCacheMonitor(NULL)
 	, _workQueueWaitCountPtr(&_scanCacheWaitCount)
 	, _workQueueMonitorPtr(&_scanCacheMonitor)
 	, _doneIndex(0)
@@ -214,8 +218,6 @@ MM_CopyForwardScheme::kill(MM_EnvironmentVLHGC *env)
 bool
 MM_CopyForwardScheme::initialize(MM_EnvironmentVLHGC *env)
 {
-	MM_GCExtensions *extensions = MM_GCExtensions::getExtensions(env);
-
 	if (!_cacheFreeList.initialize(env)) {
 		return false;
 	}
@@ -236,14 +238,18 @@ MM_CopyForwardScheme::initialize(MM_EnvironmentVLHGC *env)
 			return false;
 		}
 	}
-	if (0 != omrthread_monitor_init_with_name(&_scanCacheMonitor, 0, "MM_CopyForwardScheme::cache")) {
+	if (0 != omrthread_monitor_init_with_name(&_scanCacheMonitor, 0, "MM_CopyForwardScheme::_scanCacheMonitor")) {
+		return false;
+	}
+
+	if (0 != omrthread_monitor_init_with_name(&_freeCacheMonitor, 0, "MM_CopyForwardScheme::_freeCacheMonitor")) {
 		return false;
 	}
 	
 	/* Get the estimated cache count required.  The cachesPerThread argument is used to ensure there are at least enough active
 	 * caches for all working threads (threadCount * cachesPerThread)
 	 */
-	uintptr_t threadCount = extensions->dispatcher->threadCountMaximum();
+	uintptr_t threadCount = _extensions->dispatcher->threadCountMaximum();
 	uintptr_t compactGroupCount = MM_CompactGroupManager::getCompactGroupMaxCount(env);
 
 	/* Each thread can have a scan cache and compactGroupCount copy caches. In hierarchical, there could also be a deferred cache. */
@@ -263,13 +269,7 @@ MM_CopyForwardScheme::initialize(MM_EnvironmentVLHGC *env)
 	
 	uintptr_t minCacheCount = threadCount * cachesPerThread;
 	
-	/* Estimate how many caches we might need to describe the entire heap */
-	uintptr_t heapCaches = extensions->memoryMax / extensions->scavengerScanCacheMaximumSize;
-
-	/* use whichever value is higher */
-	uintptr_t totalCacheCount = OMR_MAX(minCacheCount, heapCaches);
-
-	if (!_cacheFreeList.resizeCacheEntries(env, totalCacheCount)) {
+	if (!_cacheFreeList.resizeCacheEntries(env, minCacheCount)) {
 		return false;
 	}
 
@@ -350,6 +350,11 @@ MM_CopyForwardScheme::tearDown(MM_EnvironmentVLHGC *env)
 	if (NULL != _scanCacheMonitor) {
 		omrthread_monitor_destroy(_scanCacheMonitor);
 		_scanCacheMonitor = NULL;
+	}
+
+	if (NULL != _freeCacheMonitor) {
+		omrthread_monitor_destroy(_freeCacheMonitor);
+		_freeCacheMonitor = NULL;
 	}
 
 	if (NULL != _reservedRegionList) {
@@ -1726,29 +1731,43 @@ MM_CopyForwardScheme::getFreeCache(MM_EnvironmentVLHGC *env)
 #endif /* J9MODRON_TGC_PARALLEL_STATISTICS */
 	/* Check the free list */
 	MM_CopyScanCacheVLHGC *cache = _cacheFreeList.popCache(env);
-	if (NULL != cache) {
-		return cache;
-	}
-
-	/* No thread can use more than _cachesPerThread cache entries at 1 time (flip, tenure, scan, large, possibly deferred)
-	 * So long as (N * _cachesPerThread) cache entries exist,
-	 * the head of the scan list will contain a valid entry */
-	env->_copyForwardStats._scanCacheOverflow = true;
-
 	if (NULL == cache) {
-		/* we couldn't get a free cache so we must be in an overflow scenario.  Try creating new cache structures on the heap */
-		cache = createScanCacheForOverflowInHeap(env);
+		bool resizePerformed = false;
+
+		omrthread_monitor_enter(_freeCacheMonitor);
+		/* Acquires a cache to check if other threads have resized the cache pool */
+		cache = _cacheFreeList.popCache(env);
 		if (NULL == cache) {
-			/* we couldn't overflow so we have no choice but to abort the copy-forward */
-			raiseAbortFlag(env);
+			uintptr_t heapCachesIncrement = OMR_MAX(16, 4 * _extensions->dispatcher->threadCountMaximum());
+
+			resizePerformed = _cacheFreeList.resizeCacheEntries(env, _cacheFreeList.getTotalCacheCount() + heapCachesIncrement);
+		}
+		omrthread_monitor_exit(_freeCacheMonitor);
+
+		if (resizePerformed) {
+			cache = _cacheFreeList.popCache(env);
+		}
+
+		if (NULL == cache) {
+			env->_copyForwardStats._scanCacheOverflow = true;
+
+			/* we couldn't get a free cache so we must be in an overflow scenario.  Try creating new cache structures on the heap */
+			cache = createScanCacheForOverflowInHeap(env);
+			if (NULL == cache) {
+				/* we couldn't overflow so we have no choice but to abort the copy-forward */
+				raiseAbortFlag(env);
+			}
+
+			/* Overflow or abort was hit so alert other threads that are waiting */
+			omrthread_monitor_enter(*_workQueueMonitorPtr);
+			if (0 != *_workQueueWaitCountPtr) {
+				omrthread_monitor_notify(*_workQueueMonitorPtr);
+			}
+			omrthread_monitor_exit(*_workQueueMonitorPtr);
+
 		}
 	}
-	/* Overflow or abort was hit so alert other threads that are waiting */
-	omrthread_monitor_enter(*_workQueueMonitorPtr);
-	if (0 != *_workQueueWaitCountPtr) {
-		omrthread_monitor_notify(*_workQueueMonitorPtr);
-	}
-	omrthread_monitor_exit(*_workQueueMonitorPtr);
+
 	return cache;
 }
 
@@ -2292,22 +2311,35 @@ MM_CopyForwardScheme::updateMarkMapAndCardTableOnCopy(MM_EnvironmentVLHGC *env, 
 MMINLINE void
 MM_CopyForwardScheme::scanOwnableSynchronizerObjectSlots(MM_EnvironmentVLHGC *env, MM_AllocationContextTarok *reservingContext, J9Object *objectPtr, ScanReason reason)
 {
-	if (scanMixedObjectSlots(env, reservingContext, objectPtr, reason)) {
-		/*
-		 * If object has been scanned without triggering abort add it to the list here.
-		 * If object scan triggered abort, it has been added to work packet
-		 * and is going to be rescanned again. It should not be added to the list here
-		 * to prevent duplication during second scan.
-		 */
-		if (SCAN_REASON_COPYSCANCACHE == reason) {
+	if (SCAN_REASON_COPYSCANCACHE == reason) {
+		addOwnableSynchronizerObjectInList(env, objectPtr);
+	} else if (SCAN_REASON_PACKET == reason) {
+		if (isObjectInEvacuateMemoryNoCheck(objectPtr)) {
 			addOwnableSynchronizerObjectInList(env, objectPtr);
-		} else if (SCAN_REASON_PACKET == reason) {
-			if (isObjectInEvacuateMemoryNoCheck(objectPtr)) {
-				addOwnableSynchronizerObjectInList(env, objectPtr);
-			}
 		}
 	}
+	scanMixedObjectSlots(env, reservingContext, objectPtr, reason);
 }
+
+void
+MM_CopyForwardScheme::doSlot(MM_EnvironmentVLHGC *env, J9Object *fromObject, J9Object **slotPtr)
+{
+	/* the reservingContext is base on related Continuation object */
+	MM_AllocationContextTarok *reservingContext = getContextForHeapAddress(fromObject);
+	copyAndForward(env, reservingContext, fromObject, slotPtr);
+}
+
+#if JAVA_SPEC_VERSION >= 24
+void
+MM_CopyForwardScheme::doContinuationSlot(MM_EnvironmentVLHGC *env, J9Object *fromObject, J9Object **slotPtr, GC_ContinuationSlotIterator *continuationSlotIterator)
+{
+	if (isHeapObject(*slotPtr)) {
+		doSlot(env, fromObject, slotPtr);
+	} else if (NULL != *slotPtr) {
+		Assert_MM_true(GC_ContinuationSlotIterator::state_monitor_records == continuationSlotIterator->getState());
+	}
+}
+#endif /* JAVA_SPEC_VERSION >= 24 */
 
 void
 MM_CopyForwardScheme::doStackSlot(MM_EnvironmentVLHGC *env, J9Object *fromObject, J9Object **slotPtr, J9StackWalkState *walkState, const void *stackLocation)
@@ -2315,9 +2347,7 @@ MM_CopyForwardScheme::doStackSlot(MM_EnvironmentVLHGC *env, J9Object *fromObject
 	if (isHeapObject(*slotPtr)) {
 		/* heap object - validate and copyforward */
 		Assert_MM_validStackSlot(MM_StackSlotValidator(MM_StackSlotValidator::COULD_BE_FORWARDED, *slotPtr, stackLocation, walkState).validate(env));
-		J9VMThread *thread = ((J9StackWalkState *)walkState)->currentThread;
-		MM_AllocationContextTarok *reservingContext = (MM_AllocationContextTarok *)MM_EnvironmentVLHGC::getEnvironment(thread)->getAllocationContext();
-		copyAndForward(MM_EnvironmentVLHGC::getEnvironment(env), reservingContext, fromObject, slotPtr);
+		doSlot(env, fromObject, slotPtr);
 	} else if (NULL != *slotPtr) {
 		/* stack object - just validate */
 		Assert_MM_validStackSlot(MM_StackSlotValidator(MM_StackSlotValidator::NOT_ON_HEAP, *slotPtr, stackLocation, walkState).validate(env));
@@ -2355,6 +2385,15 @@ MM_CopyForwardScheme::scanContinuationNativeSlots(MM_EnvironmentVLHGC *env, MM_A
 #endif /* J9VM_GC_DYNAMIC_CLASS_UNLOADING */
 
 		GC_VMThreadStackSlotIterator::scanContinuationSlots(currentThread, objectPtr, (void *)&localData, stackSlotIteratorForCopyForwardScheme, stackFrameClassWalkNeeded, false);
+
+#if JAVA_SPEC_VERSION >= 24
+		J9VMContinuation *continuation = J9VMJDKINTERNALVMCONTINUATION_VMREF(currentThread, objectPtr);
+		GC_ContinuationSlotIterator continuationSlotIterator(currentThread, continuation);
+
+		while (J9Object **slotPtr = continuationSlotIterator.nextSlot()) {
+			doContinuationSlot(env, objectPtr, slotPtr, &continuationSlotIterator);
+		}
+#endif /* JAVA_SPEC_VERSION >= 24 */
 	}
 }
 
@@ -2430,7 +2469,7 @@ MM_CopyForwardScheme::iterateAndCopyforwardSlotReference(MM_EnvironmentVLHGC *en
 	return success;
 }
 
-bool
+void
 MM_CopyForwardScheme::scanMixedObjectSlots(MM_EnvironmentVLHGC *env, MM_AllocationContextTarok *reservingContext, J9Object *objectPtr, ScanReason reason)
 {
 	if (_tracingEnabled) {
@@ -2446,7 +2485,6 @@ MM_CopyForwardScheme::scanMixedObjectSlots(MM_EnvironmentVLHGC *env, MM_Allocati
 	}
 
 	updateScanStats(env, objectPtr, reason);
-	return success;
 }
 
 void
@@ -3830,6 +3868,18 @@ private:
 		}
 	}
 
+#if JAVA_SPEC_VERSION >= 24
+	virtual void doContinuationSlot(J9Object **slotPtr, GC_ContinuationSlotIterator *continuationSlotIterator) {
+		if (_copyForwardScheme->isHeapObject(*slotPtr)) {
+			J9VMThread *thread = continuationSlotIterator->getVMThread();
+			MM_AllocationContextTarok *reservingContext = (MM_AllocationContextTarok *)MM_EnvironmentVLHGC::getEnvironment(thread)->getAllocationContext();
+			_copyForwardScheme->copyAndForward(MM_EnvironmentVLHGC::getEnvironment(_env), reservingContext, slotPtr);
+		} else if (NULL != *slotPtr) {
+			Assert_MM_true(GC_ContinuationSlotIterator::state_monitor_records == continuationSlotIterator->getState());
+		}
+	}
+#endif /* JAVA_SPEC_VERSION >= 24 */
+
 	virtual void doVMThreadSlot(J9Object **slotPtr, GC_VMThreadIterator *vmThreadIterator) {
 		if (_copyForwardScheme->isHeapObject(* slotPtr)) {
 			/* we know that threads are bound to nodes so relocalize this object into the node of the thread which directly references it */
@@ -3874,13 +3924,6 @@ private:
 		reportScanningEnded(RootScannerEntity_FinalizableObjects);
 	}
 #endif /* J9VM_GC_FINALIZATION */
-
-#if defined(J9VM_ENV_DATA64)
-	virtual bool isDataAdjacentToHeader(J9IndexableObject *src, J9IndexableObject *dst) {
-		/* Checking against src object since dst is not guarantied to be completely copied (by a racing thread that won f/w operaton). */
-		return _extensions->indexableObjectModel.isDataAdjacentToHeader(src);
-	}
-#endif /* defined(J9VM_ENV_DATA64) */
 
 public:
 	MM_CopyForwardSchemeRootScanner(MM_EnvironmentVLHGC *env, MM_CopyForwardScheme *copyForwardScheme) :
@@ -4578,6 +4621,16 @@ private:
 			Assert_MM_validStackSlot(MM_StackSlotValidator(MM_StackSlotValidator::NOT_ON_HEAP, *slotPtr, stackLocation, walkState).validate(_env));
 		}
 	}
+
+#if JAVA_SPEC_VERSION >= 24
+	virtual void doContinuationSlot(J9Object **slotPtr, GC_ContinuationSlotIterator *continuationSlotIterator) {
+		if (_copyForwardScheme->isHeapObject(*slotPtr)) {
+			verifyObject(slotPtr);
+		} else if (NULL != *slotPtr) {
+			Assert_MM_true(GC_ContinuationSlotIterator::state_monitor_records == continuationSlotIterator->getState());
+		}
+	}
+#endif /* JAVA_SPEC_VERSION >= 24 */
 
 	virtual void doVMThreadSlot(J9Object **slotPtr, GC_VMThreadIterator *vmThreadIterator) {
 		if (_copyForwardScheme->isHeapObject(*slotPtr)) {

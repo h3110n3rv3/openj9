@@ -120,6 +120,8 @@ public:
    static bool                     isUnsafeGetPutBoolean(TR::RecognizedMethod rm);
    static bool                     isUnsafePut(TR::RecognizedMethod rm);
    static bool                     isVolatileUnsafe(TR::RecognizedMethod rm);
+   static bool                     isAcquireReleaseUnsafe(TR::RecognizedMethod rm);
+   static bool                     isOpaqueUnsafe(TR::RecognizedMethod rm);
    static TR::DataType             unsafeDataTypeForArray(TR::RecognizedMethod rm);
    static TR::DataType             unsafeDataTypeForObject(TR::RecognizedMethod rm);
    static bool                     isVarHandleOperationMethod(TR::RecognizedMethod rm);
@@ -302,7 +304,6 @@ public:
    virtual bool                    isProtected();
    virtual bool                    isPublic();
    virtual bool                    isFinal();
-   virtual bool                    isStrictFP();
    virtual bool                    isInterpreted();
    virtual bool                    isInterpretedForHeuristics();
    virtual bool                    hasBackwardBranches();
@@ -585,7 +586,6 @@ public:
    virtual bool                    isProtected();
    virtual bool                    isPublic();
    virtual bool                    isFinal();
-   virtual bool                    isStrictFP();
 
    virtual bool                    isInterpreted();
    virtual bool                    isInterpretedForHeuristics();

@@ -213,15 +213,16 @@ const char *compilationErrorNames[]={
    "compilationAotPatchedCPConstant",                      // 45
    "compilationAotHasInvokeSpecialInterface",              // 46
    "compilationRelocationFailure",                         // 47
+   "compilationAOTThunkPersistenceFailure",                // 48
 #if defined(J9VM_OPT_JITSERVER)
-   "compilationStreamFailure",                             // compilationFirstJITServerFailure     = 48
-   "compilationStreamLostMessage",                         // compilationFirstJITServerFailure + 1 = 49
-   "compilationStreamMessageTypeMismatch",                 // compilationFirstJITServerFailure + 2 = 50
-   "compilationStreamVersionIncompatible",                 // compilationFirstJITServerFailure + 3 = 51
-   "compilationStreamInterrupted",                         // compilationFirstJITServerFailure + 4 = 52
-   "aotCacheDeserializationFailure",                       // compilationFirstJITServerFailure + 5 = 53
-   "aotDeserializerReset",                                 // compilationFirstJITServerFailure + 6 = 54
-   "compilationAOTCachePersistenceFailure",                // compilationFirstJITServerFailure + 7 = 55
+   "compilationStreamFailure",                             // compilationFirstJITServerFailure     = 49
+   "compilationStreamLostMessage",                         // compilationFirstJITServerFailure + 1 = 50
+   "compilationStreamMessageTypeMismatch",                 // compilationFirstJITServerFailure + 2 = 51
+   "compilationStreamVersionIncompatible",                 // compilationFirstJITServerFailure + 3 = 52
+   "compilationStreamInterrupted",                         // compilationFirstJITServerFailure + 4 = 53
+   "aotCacheDeserializationFailure",                       // compilationFirstJITServerFailure + 5 = 54
+   "aotDeserializerReset",                                 // compilationFirstJITServerFailure + 6 = 55
+   "compilationAOTCachePersistenceFailure",                // compilationFirstJITServerFailure + 7 = 56
 #endif /* defined(J9VM_OPT_JITSERVER) */
    "compilationMaxError"
 };
@@ -2141,7 +2142,7 @@ aboutToBootstrap(J9JavaVM * javaVM, J9JITConfig * jitConfig)
     * is because, the restore run may not be on the same machine as the one that created
     * the snapshot; thus the JIT code must be portable.
     */
-   if (javaVM->internalVMFunctions->isJVMInPortableRestoreMode(curThread))
+   if (javaVM->internalVMFunctions->isCheckpointAllowed(javaVM))
       {
       TR::Compiler->target.cpu = TR::CPU::detectRelocatable(TR::Compiler->omrPortLib);
       if (!J9_ARE_ANY_BITS_SET(javaVM->extendedRuntimeFlags2, J9_EXTENDED_RUNTIME2_ENABLE_PORTABLE_SHARED_CACHE))

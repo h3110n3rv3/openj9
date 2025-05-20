@@ -246,6 +246,18 @@ class SymbolReferenceTable : public OMR::SymbolReferenceTableConnector
    TR::SymbolReference * findOrCreateArrayComponentTypeAsPrimitiveSymbolRef();
    TR::SymbolReference * findOrCreateMethodTypeCheckSymbolRef(TR::ResolvedMethodSymbol * owningMethodSymbol);
    TR::SymbolReference * findOrCreateIncompatibleReceiverSymbolRef(TR::ResolvedMethodSymbol * owningMethodSymbol);
+
+   /**
+    * Used to find the symbol reference for \c java/lang/IdentityException.  If it does not already exist,
+    * it will be created.
+    *
+    * \param owningMethodSymbol
+    *     The method in which the IdentityException symbol reference needs to be created.
+    *
+    * \returns
+    *     A symbol reference for \c java/lang/IdentityException
+    */
+   TR::SymbolReference * findOrCreateIdentityExceptionSymbolRef(TR::ResolvedMethodSymbol * owningMethodSymbol);
    TR::SymbolReference * findOrCreateIncompatibleClassChangeErrorSymbolRef(TR::ResolvedMethodSymbol * owningMethodSymbol);
    TR::SymbolReference * findOrCreateReportStaticMethodEnterSymbolRef(TR::ResolvedMethodSymbol * owningMethodSymbol);
    TR::SymbolReference * findOrCreateReportMethodExitSymbolRef(TR::ResolvedMethodSymbol * owningMethodSymbol);
@@ -332,13 +344,13 @@ class SymbolReferenceTable : public OMR::SymbolReferenceTableConnector
     *  \param javaStaticReference
     *     Determines whether this symbol reference is referencing a Java object static field.
     *
-    *  \param isVolatile
-    *     Determines whether this symbol should be treated with volatile semantics.
+    *  \param mode
+    *     Determines which access mode memory semantics this symbol should be treated with.
     *
     *  \return
     *     The unsafe symbol reference with given constraints if it exists; <c>NULL</c> otherwise.
     */
-   TR::SymbolReference* findUnsafeSymbolRef(TR::DataType type, bool javaObjectReference = false, bool javaStaticReference = false, bool isVolatile = false);
+   TR::SymbolReference* findUnsafeSymbolRef(TR::DataType type, bool javaObjectReference, bool javaStaticReference, TR::Symbol::MemoryOrdering mode);
 
    /** \brief
     *     Finds an unsafe symbol reference with given constraints if it exists, or creates one if no such symbol
@@ -359,7 +371,7 @@ class SymbolReferenceTable : public OMR::SymbolReferenceTableConnector
     *  \return
     *     The unsafe symbol reference with given constraints if it exists.
     */
-   TR::SymbolReference* findOrCreateUnsafeSymbolRef(TR::DataType type, bool javaObjectReference = false, bool javaStaticReference = false, bool isVolatile = false);
+   TR::SymbolReference* findOrCreateUnsafeSymbolRef(TR::DataType type, bool javaObjectReference = false, bool javaStaticReference = false, TR::Symbol::MemoryOrdering mode = TR::Symbol::MemoryOrdering::Transparent);
 
    TR::SymbolReference * findOrCreateImmutableGenericIntShadowSymbolReference(intptr_t offset); // "Immutable" means no aliasing issues; ie. reads from these shadows can be freely reordered wrt anything else
 
@@ -414,6 +426,18 @@ class SymbolReferenceTable : public OMR::SymbolReferenceTableConnector
     *     The <storeFlattenableArrayElementNonHelper> symbol reference.
     */
    TR::SymbolReference *findOrCreateStoreFlattenableArrayElementNonHelperSymbolRef();
+
+   /**
+    * \brief
+    *    Finds the <isIdentityObject> "non-helper" symbol reference, creating it if
+    *    necessary.  The non-helper is used to test whether an object is an instance
+    *    of an identity class, in which case it returns the value one, or a value type
+    *    class, in which case it returns the value zero.
+    *
+    * \return
+    *    The <isIdentityObject> symbol reference
+    */
+   TR::SymbolReference *findOrCreateIsIdentityObjectNonHelperSymbolRef();
 
    /**
     * \brief
@@ -589,14 +613,9 @@ class SymbolReferenceTable : public OMR::SymbolReferenceTableConnector
    TR_Array<TR_BitVector *>            _immutableSymRefNumbers;
 
    /** \brief
-    *     Represents the set of symbol references to static fields of Java objects.
+    *     Represents the set of symbol references to static fields of Java objects for each access mode.
     */
-   TR_Array<TR::SymbolReference *> * _unsafeJavaStaticSymRefs;
-
-   /** \brief
-    *     Represents the set of symbol references to static volatile fields of Java objects.
-    */
-   TR_Array<TR::SymbolReference *> * _unsafeJavaStaticVolatileSymRefs;
+   TR_Array<TR::SymbolReference *> * _unsafeJavaStaticSymRefs[TR::Symbol::numberOfMemoryOrderings];
 
    ResolvedFieldShadows _resolvedFieldShadows;
 

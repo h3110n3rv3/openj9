@@ -34,6 +34,9 @@
 #include "ObjectAccessBarrierAPI.hpp"
 #include "MethodMetaData.h"
 #include "ut_j9codertvm.h"
+#if JAVA_SPEC_VERSION >= 24
+#include "ContinuationHelpers.hpp"
+#endif /* JAVA_SPEC_VERSION >= 24 */
 
 #undef DEBUG
 
@@ -44,8 +47,14 @@ old_slow_jitThrowNullPointerException(J9VMThread *currentThread);
 
 J9_EXTERN_BUILDER_SYMBOL(throwCurrentExceptionFromJIT);
 J9_EXTERN_BUILDER_SYMBOL(handlePopFramesFromJIT);
+#if JAVA_SPEC_VERSION >= 24
+J9_EXTERN_BUILDER_SYMBOL(yieldAtMonitorEnter);
+#endif /* JAVA_SPEC_VERSION >= 24 */
 #define J9_JITHELPER_ACTION_THROW		J9_BUILDER_SYMBOL(throwCurrentExceptionFromJIT)
 #define J9_JITHELPER_ACTION_POP_FRAMES	J9_BUILDER_SYMBOL(handlePopFramesFromJIT)
+#if JAVA_SPEC_VERSION >= 24
+#define J9_JITHELPER_ACTION_YIELD_AT_MONENT	J9_BUILDER_SYMBOL(yieldAtMonitorEnter)
+#endif /* JAVA_SPEC_VERSION >= 24 */
 
 J9_EXTERN_BUILDER_SYMBOL(jitRunOnJavaStack);
 #define JIT_RUN_ON_JAVA_STACK(x) (currentThread->tempSlot = (UDATA)(x), J9_BUILDER_SYMBOL(jitRunOnJavaStack))
@@ -1703,6 +1712,17 @@ slow_jitMonitorEnterImpl(J9VMThread *currentThread, bool forMethod)
 	UDATA flags = J9_STACK_FLAGS_JIT_RESOLVE_FRAME | (forMethod ? J9_STACK_FLAGS_JIT_METHOD_MONITOR_ENTER_RESOLVE : J9_STACK_FLAGS_JIT_MONITOR_ENTER_RESOLVE);
 	IDATA monstatus = (IDATA)(UDATA)currentThread->floatTemp1;
 	void *oldPC = buildJITResolveFrame(currentThread, flags, parmCount);
+#if JAVA_SPEC_VERSION >= 24
+	if ((J9_OBJECT_MONITOR_BLOCKING == monstatus) && VM_ContinuationHelpers::isYieldableVirtualThread(currentThread)) {
+		/* Try to yield the virtual thread if it will be blocked. */
+		monstatus = currentThread->javaVM->internalVMFunctions->preparePinnedVirtualThreadForUnmount(currentThread, (j9object_t)currentThread->floatTemp2, false);
+		if (monstatus > J9_OBJECT_MONITOR_BLOCKING) {
+			/* Monitor has been acquired. */
+			addr = restoreJITResolveFrame(currentThread, oldPC, forMethod, false);
+			goto done;
+		}
+	}
+#endif /* JAVA_SPEC_VERSION >= 24 */
 	if (monstatus < J9_OBJECT_MONITOR_BLOCKING) {
 		if (forMethod) {
 			/* Only mark the outer frame for failed method monitor enter - inline frames have correct maps */
@@ -1748,6 +1768,11 @@ slow_jitMonitorEnterImpl(J9VMThread *currentThread, bool forMethod)
 		case J9_OBJECT_MONITOR_OOM:
 			addr = setNativeOutOfMemoryErrorFromJIT(currentThread, J9NLS_VM_FAILED_TO_ALLOCATE_MONITOR);
 			break;
+#if JAVA_SPEC_VERSION >= 24
+		case J9_OBJECT_MONITOR_YIELD_VIRTUAL:
+			addr = J9_JITHELPER_ACTION_YIELD_AT_MONENT;
+			break;
+#endif /* JAVA_SPEC_VERSION >= 24 */
 		default:
 			Assert_CodertVM_unreachable();
 		}
@@ -2732,6 +2757,20 @@ old_slow_jitThrowArrayIndexOutOfBounds(J9VMThread *currentThread)
 }
 
 void* J9FASTCALL
+old_slow_jitThrowIdentityException(J9VMThread *currentThread)
+{
+	void *exception = NULL;
+#if defined(J9VM_OPT_VALHALLA_VALUE_TYPES)
+	OLD_JIT_HELPER_PROLOGUE(0);
+	buildJITResolveFrameForRuntimeCheck(currentThread);
+	exception = setCurrentExceptionFromJIT(currentThread, J9VMCONSTANTPOOL_JAVALANGIDENTITYEXCEPTION, NULL);
+#else /* defined(J9VM_OPT_VALHALLA_VALUE_TYPES) */
+	exception = (void *)-1;
+#endif /* defined(J9VM_OPT_VALHALLA_VALUE_TYPES) */
+	return exception;
+}
+
+void* J9FASTCALL
 impl_jitReferenceArrayCopy(J9VMThread *currentThread, UDATA lengthInBytes)
 {
 	JIT_HELPER_PROLOGUE();
@@ -3358,12 +3397,26 @@ old_slow_icallVMprJavaSendPatchupVirtual(J9VMThread *currentThread)
 	J9Class *clazz = J9OBJECT_CLAZZ(currentThread, receiver);
 	UDATA interpVTableOffset = sizeof(J9Class) - jitVTableOffset;
 	J9Method *method = *(J9Method**)((UDATA)clazz + interpVTableOffset);
-	J9ROMMethod *romMethod = J9_ROM_METHOD_FROM_RAM_METHOD(method);
-	J9ROMNameAndSignature *nas = &romMethod->nameAndSignature;
-	UDATA const thunk = (UDATA)jitConfig->thunkLookUpNameAndSig(jitConfig, nas);
-	UDATA const patchup = (UDATA)jitConfig->patchupVirtual;
-	UDATA *jitVTableSlot = (UDATA*)((UDATA)clazz + jitVTableOffset);
-	VM_AtomicSupport::lockCompareExchange(jitVTableSlot, patchup, thunk);
+	UDATA thunk = 0;
+#if defined(J9VM_OPT_OPENJDK_METHODHANDLE)
+	if (J9_BCLOOP_SEND_TARGET_METHODHANDLE_INVOKEBASIC == J9_BCLOOP_DECODE_SEND_TARGET(method->methodRunAddress)) {
+		/* Because invokeBasic() is signature-polymorphic, the signature from the ROM method is irrelevant.
+		 * We need the J2I thunk that corresponds to the signature that the JIT was using at the call site.
+		 * Since this varies depending on the call site, we can't replace the VFT entry with the J2I thunk.
+		 */
+		J9JITInvokeBasicCallSite *site = jitGetInvokeBasicCallSiteFromPC(currentThread, (UDATA)jitReturnAddress);
+		thunk = (UDATA)site->j2iThunk;
+	}
+	else
+#endif /* defined(J9VM_OPT_OPENJDK_METHODHANDLE) */
+	{
+		J9ROMMethod *romMethod = J9_ROM_METHOD_FROM_RAM_METHOD(method);
+		J9ROMNameAndSignature *nas = &romMethod->nameAndSignature;
+		thunk = (UDATA)jitConfig->thunkLookUpNameAndSig(jitConfig, nas);
+		UDATA const patchup = (UDATA)jitConfig->patchupVirtual;
+		UDATA *jitVTableSlot = (UDATA*)((UDATA)clazz + jitVTableOffset);
+		VM_AtomicSupport::lockCompareExchange(jitVTableSlot, patchup, thunk);
+	}
 	currentThread->tempSlot = thunk;
 }
 
@@ -4000,6 +4053,7 @@ initPureCFunctionTable(J9JavaVM *vm)
 	jitConfig->old_slow_jitThrowInstantiationException = (void*)old_slow_jitThrowInstantiationException;
 	jitConfig->old_slow_jitThrowNullPointerException = (void*)old_slow_jitThrowNullPointerException;
 	jitConfig->old_slow_jitThrowWrongMethodTypeException = (void*)old_slow_jitThrowWrongMethodTypeException;
+	jitConfig->old_slow_jitThrowIdentityException = (void*)old_slow_jitThrowIdentityException;
 	jitConfig->old_fast_jitTypeCheckArrayStoreWithNullCheck = (void*)old_fast_jitTypeCheckArrayStoreWithNullCheck;
 	jitConfig->old_slow_jitTypeCheckArrayStoreWithNullCheck = (void*)old_slow_jitTypeCheckArrayStoreWithNullCheck;
 	jitConfig->old_fast_jitTypeCheckArrayStore = (void*)old_fast_jitTypeCheckArrayStore;

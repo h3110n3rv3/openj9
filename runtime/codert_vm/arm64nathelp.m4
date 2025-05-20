@@ -378,6 +378,7 @@ EXCEPTION_THROW_HELPER(jitThrowInstantiationException,0)
 EXCEPTION_THROW_HELPER(jitThrowNullPointerException,0)
 EXCEPTION_THROW_HELPER(jitThrowWrongMethodTypeException,0)
 EXCEPTION_THROW_HELPER(jitThrowIncompatibleReceiver,2)
+EXCEPTION_THROW_HELPER(jitThrowIdentityException,0)
 
 dnl Write barrier helpers
 
@@ -445,6 +446,12 @@ START_PROC(cInterpreterFromJIT)
 	ldr x0,[x0,{#}J9TR_JavaVM_cInterpreter]
 	br x0
 END_PROC(cInterpreterFromJIT)
+
+ifelse(eval(ASM_JAVA_SPEC_VERSION >= 24), 1, {
+BEGIN_RETURN_POINT(jitExitInterpreter0RestoreAll)
+	RESTORE_ALL_REGS
+END_RETURN_POINT(jitExitInterpreter0RestoreAll)
+}) dnl jitExitInterpreter0RestoreAll is only supported on JAVA 24+
 
 BEGIN_RETURN_POINT(jitExitInterpreter0)
 END_RETURN_POINT(jitExitInterpreter0)
@@ -788,6 +795,12 @@ START_PROC(jitDecompileAfterMonitorEnter)
 	CALL_C_WITH_VMTHREAD(c_jitDecompileAfterMonitorEnter)
 	BRANCH_VIA_VMTHREAD(J9TR_VMThread_tempSlot)
 END_PROC(jitDecompileAfterMonitorEnter)
+
+ifelse(eval(ASM_JAVA_SPEC_VERSION >= 24), 1, {
+START_PROC(yieldAtMonitorEnter)
+	CINTERP(J9TR_bcloop_yield_monent, 0)
+END_PROC(yieldAtMonitorEnter)
+}) dnl yieldAtMonitorEnter is only supported on JAVA 24+
 
 START_PROC(executeCurrentBytecodeFromJIT)
 	CINTERP(J9TR_bcloop_execute_bytecode, 0)

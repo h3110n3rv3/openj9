@@ -43,7 +43,7 @@ class TR_J9EstimateCodeSize : public TR_EstimateCodeSize
    {
    public:
 
-      TR_J9EstimateCodeSize() : TR_EstimateCodeSize(), _analyzedSize(0), _lastCallBlockFrequency(-1) { }
+      TR_J9EstimateCodeSize() : TR_EstimateCodeSize(), _analyzedSize(0), _bigCalleesSize(0), _lastCallBlockFrequency(-1) { }
 
       int32_t getOptimisticSize()       { return _analyzedSize; }
 
@@ -118,7 +118,7 @@ class TR_J9EstimateCodeSize : public TR_EstimateCodeSize
                              TR::Compilation *comp);
 
    protected:
-      bool estimateCodeSize(TR_CallTarget *, TR_CallStack * , bool recurseDown = true);
+      bool estimateCodeSize(TR_CallTarget *, TR_CallStack * , bool recurseDown = true, int32_t callerAnalyzedSizeThreshold = 0);
 
      /** \brief
       *     Generates a CFG for the calltarget->_calleeMethod.
@@ -150,7 +150,7 @@ class TR_J9EstimateCodeSize : public TR_EstimateCodeSize
       *     Reference to cfg
       */
       TR::CFG &processBytecodeAndGenerateCFG(TR_CallTarget *calltarget, TR::Region &cfgRegion, TR_J9ByteCodeIterator &bci, NeedsPeekingHeuristic &nph, TR::Block** blocks, flags8_t * flags);
-      bool realEstimateCodeSize(TR_CallTarget *calltarget, TR_CallStack *prevCallStack, bool recurseDown, TR::Region &cfgRegion);
+      bool realEstimateCodeSize(TR_CallTarget *calltarget, TR_CallStack *prevCallStack, bool recurseDown, TR::Region &cfgRegion, int32_t callerAnalyzedSizeThreshold = 0);
 
       bool reduceDAAWrapperCodeSize(TR_CallTarget* target);
 
@@ -165,6 +165,7 @@ class TR_J9EstimateCodeSize : public TR_EstimateCodeSize
 
       int32_t _lastCallBlockFrequency;
       int32_t _analyzedSize;          // size if we assume we are doing a partial inline
+      int32_t _bigCalleesSize;
    };
 
 #define NUM_PREV_BC 5

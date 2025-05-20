@@ -52,6 +52,10 @@ static constexpr const char * const threadStateNames[] = {
 	"STATE_BLOCKED_ON_MONITOR_ENTER"
 };
 
+static constexpr const char * const oopModeTypeNames[] = {
+	"Zero based"
+};
+
 enum StringEnconding {
 	NullString = 0,
 	EmptyString,
@@ -73,6 +77,7 @@ enum MetadataTypeID {
 	VirtualizationInformationID = 89,
 	InitialSystemPropertyID = 90,
 	InitialEnvironmentVariableID = 91,
+	SystemProcessID = 92,
 	CPUInformationID = 93,
 	CPULoadID = 95,
 	ThreadCPULoadID = 96,
@@ -81,6 +86,10 @@ enum MetadataTypeID {
 	ClassLoadingStatisticsID = 100,
 	PhysicalMemoryID = 108,
 	ExecutionSampleID = 109,
+	ThreadDumpID = 111,
+	NativeLibraryID = 112,
+	GCHeapConfigID = 133,
+	YoungGenerationConfigID = 134,
 	ThreadID = 164,
 	ThreadGroupID = 165,
 	ClassID = 166,
@@ -88,6 +97,7 @@ enum MetadataTypeID {
 	MethodID = 168,
 	SymbolID = 169,
 	ThreadStateID = 170,
+	NarrowOopModesID = 180,
 	ModuleID = 186,
 	PackageID = 187,
 	StackTraceID = 188,
@@ -147,6 +157,7 @@ private:
 	static constexpr int CHECKPOINT_EVENT_HEADER_AND_FOOTER = 68;
 	static constexpr int STRING_CONSTANT_SIZE = 128;
 	static constexpr int THREADSTATE_ENTRY_LENGTH = CHECKPOINT_EVENT_HEADER_AND_FOOTER + sizeof(threadStateNames) + (THREADSTATE_COUNT * STRING_HEADER_LENGTH);
+	static constexpr int OOP_MODES_ENTRY_SIZE = CHECKPOINT_EVENT_HEADER_AND_FOOTER + sizeof(oopModeTypeNames) + (OOPModeTypeCount * STRING_HEADER_LENGTH);
 	static constexpr int CLASS_ENTRY_ENTRY_SIZE = (5 * sizeof(U_64)) + sizeof(U_8);
 	static constexpr int CLASSLOADER_ENTRY_SIZE = 3 * sizeof(U_64);
 	static constexpr int PACKAGE_ENTRY_SIZE = (3 * sizeof(U_64)) + sizeof(U_8);
@@ -176,6 +187,9 @@ private:
 	static constexpr int CLASS_LOADING_STATISTICS_EVENT_SIZE = 5 * sizeof(I_64);
 	static constexpr int THREAD_CONTEXT_SWITCH_RATE_SIZE = sizeof(float) + (3 * sizeof(I_64));
 	static constexpr int THREAD_STATISTICS_EVENT_SIZE = (6 * sizeof(U_64)) + sizeof(U_32);
+	static constexpr int THREAD_DUMP_EVENT_SIZE_PER_THREAD = 1000;
+	static constexpr int SYSTEM_PROCESS_EVENT_SIZE = (4 * sizeof(U_64)) + 32 /* pid string */;
+	static constexpr int NATIVE_LIBRARY_ADDRESS_SIZE = (4 * sizeof(U_64)) + (2 * sizeof(UDATA)) + sizeof(U_8);
 
 	static constexpr int METADATA_ID = 1;
 
@@ -245,9 +259,9 @@ public:
 	}
 
 	void
-	loadEvents()
+	loadEvents(bool dumpCalled)
 	{
-		_constantPoolTypes.loadEvents();
+		_constantPoolTypes.loadEvents(dumpCalled);
 		_buildResult = _constantPoolTypes.getBuildResult();
 	}
 
@@ -290,7 +304,7 @@ done:
 
 	}
 
-	void writeJFRChunk()
+	void writeJFRChunk(bool dumpCalled)
 	{
 		U_8 *buffer = NULL;
 		UDATA requiredBufferSize = 0;
@@ -328,7 +342,7 @@ done:
 		if (NULL == buffer) {
 			_buildResult = OutOfMemory;
 		} else {
-			VM_BufferWriter writer(buffer, requiredBufferSize);
+			VM_BufferWriter writer(privatePortLibrary, buffer, requiredBufferSize);
 
 			_bufferWriter = &writer;
 
@@ -341,6 +355,10 @@ done:
 			_checkPointEventOffset = writeThreadStateCheckpointEvent();
 
 			writeFrameTypeCheckpointEvent();
+
+			if (0 == _vm->jfrState.jfrChunkCount) {
+				writeNarrowOOPModeTypesEvent();
+			}
 
 			writeThreadCheckpointEvent();
 
@@ -397,9 +415,19 @@ done:
 				writeInitialSystemPropertyEvents(_vm);
 
 				writeInitialEnvironmentVariableEvents();
+
+				writeGCHeapConfigurationEvent();
+
+				writeYoungGenerationConfigurationEvent();
 			}
 
 			writePhysicalMemoryEvent();
+
+			if (dumpCalled) {
+				writeThreadDumpEvent();
+				pool_do(_constantPoolTypes.getSystemProcessTable(), &writeSystemProcessEvent, this);
+				pool_do(_constantPoolTypes.getNativeLibraryTable(), &writeNativeLibraryEvent, this);
+			}
 
 			writeJFRHeader();
 
@@ -596,13 +624,13 @@ done:
 		VM_BufferWriter *_bufferWriter = (VM_BufferWriter *)userData;
 
 		/* reserve size field */
-		U_8 *dataStart = _bufferWriter->getAndIncCursor(sizeof(U_32));
+		U_8 *dataStart = reserveEventSize(_bufferWriter);
 
 		/* write event type */
 		_bufferWriter->writeLEB128(MonitorEnterID);
 
-		/* write start time - this is when the sleep started not when it ended so we
-		 * need to subtract the duration since the event is emitted when the sleep ends.
+		/* write start time - this is when the monitor enter started not when it ended so we
+		 * need to subtract the duration since the event is emitted when the monitor enter ends.
 		 */
 		_bufferWriter->writeLEB128(entry->ticks - entry->duration);
 
@@ -632,7 +660,7 @@ done:
 	writeThreadParkEvent(void *anElement, void *userData)
 	{
 		ThreadParkEntry *entry = (ThreadParkEntry *)anElement;
-		VM_BufferWriter *_bufferWriter = (VM_BufferWriter *) userData;
+		VM_BufferWriter *_bufferWriter = (VM_BufferWriter *)userData;
 
 		/* reserve size field */
 		U_8 *dataStart = reserveEventSize(_bufferWriter);
@@ -658,10 +686,10 @@ done:
 		_bufferWriter->writeLEB128(entry->parkedClass);
 
 		/* timeout value which is always in millis */
-		_bufferWriter->writeLEB128(entry->timeOut/1000000);
+		_bufferWriter->writeLEB128(entry->timeOut / 1000000);
 
 		/* until value which is always in millis */
-		_bufferWriter->writeLEB128(entry->untilTime/1000000);
+		_bufferWriter->writeLEB128(entry->untilTime / 1000000);
 
 		/* address of monitor */
 		_bufferWriter->writeLEB128(entry->parkedAddress);
@@ -758,6 +786,8 @@ done:
 
 	void writeStringLiteral(const char *string, UDATA len);
 
+	void writeFormattedString(const char *format, ...);
+
 	U_8 *writeThreadStateCheckpointEvent();
 
 	U_8 *writePackageCheckpointEvent();
@@ -790,6 +820,14 @@ done:
 
 	U_8 *writeOSInformationEvent();
 
+	U_8 *writeThreadDumpEvent();
+
+	void writeNarrowOOPModeTypesEvent();
+
+	void writeGCHeapConfigurationEvent();
+
+	void writeYoungGenerationConfigurationEvent();
+
 	void writeInitialSystemPropertyEvents(J9JavaVM *vm);
 
 	void writeInitialEnvironmentVariableEvents();
@@ -799,6 +837,10 @@ done:
 	static void writeThreadContextSwitchRateEvent(void *anElement, void *userData);
 
 	static void writeThreadStatisticsEvent(void *anElement, void *userData);
+
+	static void writeSystemProcessEvent(void *anElement, void *userData);
+
+	static void writeNativeLibraryEvent(void *anElement, void *userData);
 
 	UDATA
 	calculateRequiredBufferSize()
@@ -868,7 +910,15 @@ done:
 
 		requiredBufferSize += _constantPoolTypes.getThreadContextSwitchRateCount() * THREAD_CONTEXT_SWITCH_RATE_SIZE;
 
-		requiredBufferSize += (_constantPoolTypes.getThreadStatisticsCount() * THREAD_STATISTICS_EVENT_SIZE);
+		requiredBufferSize += _constantPoolTypes.getThreadStatisticsCount() * THREAD_STATISTICS_EVENT_SIZE;
+
+		requiredBufferSize += _vm->peakThreadCount * THREAD_DUMP_EVENT_SIZE_PER_THREAD;
+
+		requiredBufferSize += (_constantPoolTypes.getSystemProcessCount() * SYSTEM_PROCESS_EVENT_SIZE)
+				+ _constantPoolTypes.getSystemProcessStringSizeTotal();
+
+		requiredBufferSize += (_constantPoolTypes.getNativeLibraryCount() * NATIVE_LIBRARY_ADDRESS_SIZE)
+				+ _constantPoolTypes.getNativeLibraryPathSizeTotal();
 
 		return requiredBufferSize;
 	}

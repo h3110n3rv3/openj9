@@ -5932,24 +5932,6 @@ TR_J9VMBase::setIProfilerCallCount(TR_OpaqueMethodBlock *caller, int32_t bcIndex
       profiler->setCallCount(caller, bcIndex, count, comp);
    }
 
-void
-TR_J9VMBase::setIProfilerCallCount(TR_ByteCodeInfo &bcInfo, int32_t count, TR::Compilation *comp)
-   {
-   TR_IProfiler *profiler = getIProfiler();
-   if (profiler)
-      profiler->setCallCount(bcInfo, count, comp);
-   }
-
-int32_t
-TR_J9VMBase::getCGEdgeWeight(TR::Node *callerNode, TR_OpaqueMethodBlock *callee, TR::Compilation *comp)
-   {
-   TR_IProfiler *profiler = getIProfiler();
-   if (profiler)
-      return profiler->getCGEdgeWeight(callerNode, callee, comp);
-
-   return 0;
-   }
-
 bool
 TR_J9VMBase::isCallGraphProfilingEnabled()
    {
@@ -9572,7 +9554,7 @@ TR_J9SharedCacheVM::setJ2IThunk(char *signatureChars, uint32_t signatureLength, 
       {
       TR::Compilation* comp = _compInfoPT->getCompilation();
       if (comp)
-         comp->failCompilation<TR::CompilationException>("Failed to persist thunk");
+         comp->failCompilation<J9::AOTThunkPersistenceFailure>("Failed to persist thunk");
       else
          throw TR::CompilationException();
       }
@@ -9612,7 +9594,7 @@ TR_J9SharedCacheVM::persistMHJ2IThunk(void *thunk)
       {
       TR::Compilation* comp = _compInfoPT->getCompilation();
       if (comp)
-         comp->failCompilation<TR::CompilationException>("Failed to persist thunk");
+         comp->failCompilation<J9::AOTThunkPersistenceFailure>("Failed to persist MH thunk");
       else
          throw TR::CompilationException();
       }
@@ -9760,13 +9742,13 @@ jlong JNICALL Java_java_lang_invoke_ThunkTuple_initialInvokeExactThunk
    (JNIEnv *env, jclass clazz)
    {
 #if defined(J9ZOS390)
-   return (jlong)TOC_UNWRAP_ADDRESS(_initialInvokeExactThunkGlue);
+   return JLONG_FROM_POINTER(TOC_UNWRAP_ADDRESS(_initialInvokeExactThunkGlue));
 #elif defined(TR_HOST_POWER) && (defined(TR_HOST_64BIT) || defined(AIXPPC)) && !defined(__LITTLE_ENDIAN__)
-   return (jlong)(*(void **)_initialInvokeExactThunkGlue);
+   return JLONG_FROM_POINTER(*(void **)_initialInvokeExactThunkGlue);
 #elif defined(TR_HOST_X86)
-   return (jlong)initialInvokeExactThunkGlue;
+   return JLONG_FROM_POINTER(initialInvokeExactThunkGlue);
 #else
-   return (jlong)_initialInvokeExactThunkGlue;
+   return JLONG_FROM_POINTER(_initialInvokeExactThunkGlue);
 #endif
    }
 
@@ -9777,8 +9759,8 @@ jlong JNICALL Java_java_lang_invoke_ThunkTuple_initialInvokeExactThunk
 jint JNICALL Java_java_lang_invoke_InterfaceHandle_convertITableIndexToVTableIndex
   (JNIEnv *env, jclass InterfaceMethodHandle, jlong interfaceArg, jint itableIndex, jlong receiverClassArg)
    {
-   J9Class  *interfaceClass = (J9Class*)(intptr_t)interfaceArg;
-   J9Class  *receiverClass  = (J9Class*)(intptr_t)receiverClassArg;
+   J9Class  *interfaceClass = (J9Class *)JLONG_TO_POINTER(interfaceArg);
+   J9Class  *receiverClass  = (J9Class *)JLONG_TO_POINTER(receiverClassArg);
    J9ITable *itableEntry;
    for (itableEntry = (J9ITable*)receiverClass->iTable; itableEntry; itableEntry = itableEntry->next)
       if (itableEntry->interfaceClass == interfaceClass)

@@ -24,6 +24,7 @@
 #define JITSERVER_COMPILATION_THREAD_H
 
 #include "control/CompilationThread.hpp"
+#include "control/JITServerHelpers.hpp"
 #include "env/j9methodServer.hpp"
 #include "runtime/JITClientSession.hpp"
 
@@ -34,6 +35,14 @@ using IPTableHeap_t = UnorderedMap<J9Method *, IPTableHeapEntry *>;
 using ResolvedMirrorMethodsPersistIP_t = Vector<TR_ResolvedJ9Method *>;
 using ClassOfStatic_t = UnorderedMap<std::pair<TR_OpaqueClassBlock *, int32_t>, TR_OpaqueClassBlock *>;
 using FieldOrStaticAttrTable_t = UnorderedMap<std::pair<TR_OpaqueClassBlock *, int32_t>, TR_J9MethodFieldAttributes>;
+
+using CompilationRequest = std::tuple<
+   uint64_t, uint32_t, uint32_t, J9Method *, J9Class *, TR_OptimizationPlan, std::string,
+   J9::IlGeneratorMethodDetailsType, std::vector<TR_OpaqueClassBlock *>, std::vector<TR_OpaqueClassBlock *>,
+   JITServerHelpers::ClassInfoTuple, std::string, std::string, std::string, std::string,
+   bool, bool, bool, bool, uint32_t, uintptr_t, std::vector<J9Class *>, std::vector<J9Class *>,
+   std::vector<JITServerHelpers::ClassInfoTuple>, std::vector<uintptr_t>
+>;
 
 void outOfProcessCompilationEnd(TR_MethodToBeCompiled *entry, TR::Compilation *comp);
 
@@ -83,6 +92,8 @@ public:
    size_t getClientOptionsSize() { return _clientOptionsSize; }
 
    bool cacheIProfilerInfo(TR_OpaqueMethodBlock *method, uint32_t byteCodeIndex, TR_IPBytecodeHashTableEntry *entry);
+   bool cacheIProfilerInfo(TR_OpaqueMethodBlock *method, const Vector<TR_IPBytecodeHashTableEntry *> &entries);
+
    TR_IPBytecodeHashTableEntry *getCachedIProfilerInfo(TR_OpaqueMethodBlock *method, uint32_t byteCodeIndex, bool *methodInfoPresent);
 
    void cacheResolvedMethod(TR_ResolvedMethodKey key, TR_OpaqueMethodBlock *method, uint32_t vTableSlot, const TR_ResolvedJ9JITServerMethodInfo &methodInfo, bool isUnresolvedInCP, int32_t ttlForUnresolved = 2);
@@ -172,6 +183,18 @@ private:
    bool serveCachedAOTMethod(TR_MethodToBeCompiled &entry, J9Method *method, J9Class *definingClass,
                              TR_OptimizationPlan *optPlan, ClientSessionData *clientData,
                              J9::J9SegmentProvider &scratchSegmentProvider);
+
+   void processCompilationRequest(CompilationRequest& req, JITServer::ServerStream *stream,
+                                  TR::CompilationInfo *compInfo, J9VMThread *compThread,
+                                  ClientSessionData *& clientSession, TR_MethodToBeCompiled &entry,
+                                  TR_OptimizationPlan *& optPlan, J9::J9SegmentProvider &scratchSegmentProvider,
+                                  uint64_t& clientId, uint32_t& seqNo, bool& hasUpdatedSeqNo,
+                                  bool& useAotCompilation, bool& isCriticalRequest, bool& hasIncNumActiveThreads,
+                                  bool& aotCacheHit, bool& abortCompilation);
+
+   void processAOTCacheMapRequest(const std::string& aotCacheName,
+                                  TR::CompilationInfo *compInfo,
+                                  JITServer::ServerStream *stream);
 
    TR_PersistentMethodInfo *_recompilationMethodInfo;
    uint32_t _seqNo;

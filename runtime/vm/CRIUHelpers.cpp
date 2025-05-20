@@ -95,7 +95,7 @@ jvmCheckpointHooks(J9VMThread *currentThread)
 	/* initialize before running checkpoint hooks */
 	initializeCriuHooks(currentThread);
 	/* make sure Java hooks are the first thing run when initiating checkpoint */
-	runStaticMethod(currentThread, J9UTF8_DATA(&j9InternalCheckpointHookAPI_name), &nas, 0, NULL);
+	runStaticMethod(currentThread, J9UTF8_DATA((J9UTF8 *)&j9InternalCheckpointHookAPI_name), &nas, 0, NULL);
 
 	if (VM_VMHelpers::exceptionPending(currentThread)) {
 		result = FALSE;
@@ -116,7 +116,7 @@ jvmRestoreHooks(J9VMThread *currentThread)
 	Assert_VM_true(isCRaCorCRIUSupportEnabled(vm));
 
 	/* make sure Java hooks are the last thing run before restore */
-	runStaticMethod(currentThread, J9UTF8_DATA(&j9InternalCheckpointHookAPI_name), &nas, 0, NULL);
+	runStaticMethod(currentThread, J9UTF8_DATA((J9UTF8 *)&j9InternalCheckpointHookAPI_name), &nas, 0, NULL);
 
 	if (VM_VMHelpers::exceptionPending(currentThread)) {
 		result = FALSE;
@@ -185,6 +185,12 @@ BOOLEAN
 isDebugAgentDisabled(J9JavaVM *vm)
 {
 	return isCheckpointAllowed(vm) && vm->checkpointState.isDebugOnRestoreEnabled;
+}
+
+BOOLEAN
+isTimeCompensationEnabled(J9VMThread *currentThread)
+{
+	return J9_ARE_ANY_BITS_SET(currentThread->javaVM->checkpointState.flags, J9VM_CRIU_ENABLE_TIME_COMPENSATION);
 }
 
 void
@@ -1986,7 +1992,9 @@ criuCheckpointJVMImpl(JNIEnv *env,
 		 * if there is no change for j9time_nano_time() start point.
 		 * This value might be negative.
 		 */
-		portLibrary->nanoTimeMonotonicClockDelta = restoreNanoTimeMonotonic - checkpointNanoTimeMonotonic;
+		if (isTimeCompensationEnabled(currentThread)) {
+			portLibrary->nanoTimeMonotonicClockDelta = restoreNanoTimeMonotonic - checkpointNanoTimeMonotonic;
+		}
 		Trc_VM_criu_restore_nano_times(currentThread, restoreNanoUTCTime, checkpointNanoUTCTime, vm->checkpointState.checkpointRestoreTimeDelta,
 				restoreNanoTimeMonotonic, checkpointNanoTimeMonotonic, portLibrary->nanoTimeMonotonicClockDelta);
 

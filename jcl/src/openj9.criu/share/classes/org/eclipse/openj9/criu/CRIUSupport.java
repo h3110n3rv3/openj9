@@ -113,6 +113,7 @@ public final class CRIUSupport {
 	@Deprecated(forRemoval=true)
 	public CRIUSupport(Path imageDir) {
 		System.err.println("WARNING: CRIUSupport(imageDir) constructor is deprecated, please use CRIUSupport.getCRIUSupport() and setImageDir(imageDir)"); //$NON-NLS-1$
+		singletonInternalCRIUSupport.setImageDir(imageDir);
 	}
 
 	/**
@@ -122,6 +123,15 @@ public final class CRIUSupport {
 	 */
 	public static boolean isCRIUSupportEnabled() {
 		return InternalCRIUSupport.isCRIUSupportEnabledAndNativeLoaded();
+	}
+
+	/**
+	 * Queries if the time compensation is enabled.
+	 *
+	 * @return true if the time compensation is enabled, false otherwise
+	 */
+	public static boolean isTimeCompensationEnabled() {
+		return InternalCRIUSupport.isTimeCompensationEnabled();
 	}
 
 	/**

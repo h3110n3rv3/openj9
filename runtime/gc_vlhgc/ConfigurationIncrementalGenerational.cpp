@@ -98,6 +98,16 @@ MM_ConfigurationIncrementalGenerational::createHeapWithManager(MM_EnvironmentBas
 	if (NULL == heap) {
 		return NULL;
 	}
+#if defined(J9VM_GC_SPARSE_HEAP_ALLOCATION)
+#if !defined(J9ZTPF)
+	/* Set off-heap enabled as default for balanced GC */
+	extensions->isVirtualLargeObjectHeapEnabled = true;
+#endif /* !defined(J9ZTPF) */
+
+	if (extensions->virtualLargeObjectHeap._wasSpecified) {
+		extensions->isVirtualLargeObjectHeapEnabled = extensions->virtualLargeObjectHeap._valueSpecified;
+	}
+#endif /* defined(J9VM_GC_SPARSE_HEAP_ALLOCATION) */
 
 #if defined(J9VM_GC_ENABLE_DOUBLE_MAP)
 	/* Enable double mapping if glibc version 2.27 or newer is found. For double map to
@@ -113,7 +123,7 @@ MM_ConfigurationIncrementalGenerational::createHeapWithManager(MM_EnvironmentBas
 	 * also need to check if region size is a bigger or equal to multiple of page size.
 	 *
 	 */
-	if (!extensions->isVirtualLargeObjectHeapRequested && extensions->isArrayletDoubleMapRequested && extensions->isArrayletDoubleMapAvailable) {
+	if (!extensions->isVirtualLargeObjectHeapEnabled && extensions->isArrayletDoubleMapRequested && extensions->isArrayletDoubleMapAvailable) {
 		uintptr_t pagesize = heap->getPageSize();
 		if (!extensions->memoryManager->isLargePage(env, pagesize) || (pagesize <= extensions->getOmrVM()->_arrayletLeafSize)) {
 			extensions->indexableObjectModel.setEnableDoubleMapping(true);
@@ -164,27 +174,18 @@ MM_ConfigurationIncrementalGenerational::createHeapWithManager(MM_EnvironmentBas
 	 */
 	vm->indexableObjectLayout = J9IndexableObjectLayout_DataAddr_Arraylet;
 #if defined(J9VM_GC_SPARSE_HEAP_ALLOCATION)
-	if (extensions->isVirtualLargeObjectHeapRequested) {
+	if (extensions->isVirtualLargeObjectHeapEnabled) {
 		/* Create off-heap */
 		MM_SparseVirtualMemory *largeObjectVirtualMemory = MM_SparseVirtualMemory::newInstance(env, OMRMEM_CATEGORY_MM_RUNTIME_HEAP, heap);
 		if (NULL != largeObjectVirtualMemory) {
 			extensions->largeObjectVirtualMemory = largeObjectVirtualMemory;
 			extensions->indexableObjectModel.setEnableVirtualLargeObjectHeap(true);
-			extensions->isVirtualLargeObjectHeapEnabled = true;
 			/* Overriding the original assumption that Balanced has arraylets. */
 			vm->indexableObjectLayout = J9IndexableObjectLayout_DataAddr_NoArraylet;
 			/* reset vm->unsafeIndexableHeaderSize for off-heap case */
 			vm->unsafeIndexableHeaderSize = 0;
 		} else {
-#if defined(OMR_GC_VLHGC_CONCURRENT_COPY_FORWARD)
-			extensions->heapRegionStateTable->kill(env->getForge());
-			extensions->heapRegionStateTable = NULL;
-#endif /* defined(OMR_GC_VLHGC_CONCURRENT_COPY_FORWARD) */
-			extensions->compressedCardTable->kill(env);
-			extensions->compressedCardTable = NULL;
-			extensions->cardTable->kill(env);
-			extensions->cardTable = NULL;
-			heap->kill(env);
+			tearDown(env);
 			return NULL;
 		}
 	}
@@ -396,6 +397,13 @@ MM_ConfigurationIncrementalGenerational::tearDown(MM_EnvironmentBase *env)
 		extensions->heapRegionStateTable = NULL;
 	}
 #endif /* defined(OMR_GC_VLHGC_CONCURRENT_COPY_FORWARD) */
+
+#if defined(J9VM_GC_SPARSE_HEAP_ALLOCATION)
+	if (NULL != extensions->largeObjectVirtualMemory) {
+		extensions->largeObjectVirtualMemory->kill(env);
+		extensions->largeObjectVirtualMemory = NULL;
+	}
+#endif /* defined(J9VM_GC_SPARSE_HEAP_ALLOCATION) */
 
 	MM_Configuration::tearDown(env);
 

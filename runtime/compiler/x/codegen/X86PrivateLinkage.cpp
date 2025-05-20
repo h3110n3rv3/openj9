@@ -1473,7 +1473,11 @@ void TR::X86CallSite::computeProfiledTargets()
                 (!profiledInterfaceMethod->isInterpreted() ||
                  profiledInterfaceMethod->isJITInternalNative()))
                {
-               if (frequency < getMinProfiledCallFrequency())
+               float minProfiledCallFrequency = getMinProfiledCallFrequency();
+               if (comp()->getMethodHotness() > warm)
+                  minProfiledCallFrequency = 0.0f;
+
+               if (frequency < minProfiledCallFrequency)
                   {
                   if (comp()->getOption(TR_TraceCG))
                      traceMsg(comp(), " - Too infrequent");
@@ -1508,7 +1512,10 @@ void TR::X86CallSite::computeProfiledTargets()
 
       _useLastITableCache = !comp()->getOption(TR_DisableLastITableCache) ? true : false;
       // Disable lastITable logic if all the implementers can fit into the pic slots during non-startup state
-      if (_useLastITableCache && comp()->target().is64Bit() && _interfaceClassOfMethod && comp()->getPersistentInfo()->getJitState() != STARTUP_STATE)
+      // Since instruction cache pressure is not very significant at higher opt levels, and new classes could be loaded in the future.
+      // So, keep this opt enabled at higher opt levels to save path length.
+      //
+      if (_useLastITableCache && comp()->target().is64Bit() && (comp()->getMethodHotness() <= warm) && _interfaceClassOfMethod && comp()->getPersistentInfo()->getJitState() != STARTUP_STATE)
          {
          J9::X86::PrivateLinkage *privateLinkage = static_cast<J9::X86::PrivateLinkage *>(getLinkage());
          int32_t numPICSlots = numStaticPICSlots + privateLinkage->IPicParameters.defaultNumberOfSlots;
@@ -1987,6 +1994,15 @@ void J9::X86::PrivateLinkage::buildDirectCall(
          }
 
       callInstr = generateHelperCallInstruction(callNode, TR_j2iTransition, NULL, cg());
+
+#if defined(J9VM_OPT_OPENJDK_METHODHANDLE)
+      auto rm = methodSymbol->getMandatoryRecognizedMethod();
+      if (rm == TR::java_lang_invoke_MethodHandle_invokeBasic)
+         {
+         cg()->addInvokeBasicCallSite(callNode, callInstr);
+         }
+#endif
+
       cg()->stopUsingRegister(ramMethodReg);
       }
    else if (comp()->target().is64Bit() && methodSymbol->isJITInternalNative())
@@ -2295,6 +2311,15 @@ TR::Instruction *J9::X86::PrivateLinkage::buildVFTCall(TR::X86CallSite &site, TR
          TR::LabelSymbol *jmpLabel   = TR::LabelSymbol::create(cg()->trHeapMemory(),cg());
          callInstr = generateLabelInstruction(TR::InstOpCode::CALLImm4, callNode, jmpLabel, cg());
 
+#if defined(J9VM_OPT_OPENJDK_METHODHANDLE)
+         // JITHelpers.dispatchVirtual() can target MethodHandle.invokeBasic().
+         auto rm = resolvedMethodSymbol->getMandatoryRecognizedMethod();
+         if (rm == TR::com_ibm_jit_JITHelpers_dispatchVirtual)
+            {
+            cg()->addInvokeBasicCallSite(callNode, callInstr);
+            }
+#endif
+
          // Jump outlined
          //
          {
@@ -2473,8 +2498,10 @@ TR::Register *J9::X86::PrivateLinkage::buildCallPostconditions(TR::X86CallSite &
             }
          }
 
-      TR_LiveRegisters *lr = cg()->getLiveRegisters(TR_FPR);
-      if(!lr || lr->getNumberOfLiveRegisters() > 0)
+      TR_LiveRegisters *liveFPRs = cg()->getLiveRegisters(TR_FPR);
+      TR_LiveRegisters *liveVRFs = cg()->getLiveRegisters(TR_VRF);
+
+      if (!liveFPRs || liveFPRs->getNumberOfLiveRegisters() > 0 || !liveVRFs || liveVRFs->getNumberOfLiveRegisters() > 0)
          {
          for (regIndex = TR::RealRegister::FirstXMMR; regIndex <= TR::RealRegister::LastXMMR; regIndex = (TR::RealRegister::RegNum)(regIndex + 1))
             {

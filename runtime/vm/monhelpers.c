@@ -140,6 +140,15 @@ restart:
 				TRIGGER_J9HOOK_VM_MONITOR_CONTENDED_EXIT(vmStruct->javaVM->hookInterface, vmStruct, monitor);
 
 				omrthread_monitor_exit(monitor);
+#if JAVA_SPEC_VERSION >= 24
+				if (J9_ARE_ANY_BITS_SET(vmStruct->javaVM->extendedRuntimeFlags3, J9_EXTENDED_RUNTIME3_YIELD_PINNED_CONTINUATION)
+				&& (0 != objectMonitor->virtualThreadWaitCount)
+				) {
+					omrthread_monitor_enter(vmStruct->javaVM->blockedVirtualThreadsMutex);
+					omrthread_monitor_notify(vmStruct->javaVM->blockedVirtualThreadsMutex);
+					omrthread_monitor_exit(vmStruct->javaVM->blockedVirtualThreadsMutex);
+				}
+#endif /* JAVA_SPEC_VERSION >= 24 */
 			}
 		}
 		Trc_VM_objectMonitorExit_Exit_FCBSet(vmStruct);
@@ -150,10 +159,11 @@ restart:
 		J9ObjectMonitor *objectMonitor = NULL;
 		J9ThreadAbstractMonitor *monitor = NULL;
 		IDATA deflate = 1;
-		
-		objectMonitor = J9_INFLLOCK_OBJECT_MONITOR(lock);		
+
+		objectMonitor = J9_INFLLOCK_OBJECT_MONITOR(lock);
 		monitor = (J9ThreadAbstractMonitor *)objectMonitor->monitor;
 		Assert_VM_notNull(monitor);
+		Assert_VM_false(IS_J9_OBJECT_MONITOR_OWNER_DETACHED(monitor->owner));
 
 #ifdef OMR_THR_ADAPTIVE_SPIN
 		/* for now we don't allow deflation if spinning has been disabled for this monitor
@@ -170,19 +180,15 @@ restart:
 
 		/*
 		 * Are we releasing the inflated monitor? (count is 1)
-		 * If we are, the question becomes: 
-		 *    May we deflate? If so, CAN we deflate? 
-		 * 
+		 * If we are, the question becomes:
+		 *    May we deflate? If so, CAN we deflate?
+		 *
 		 * We may deflate if the user has specified that we may. (thrDeflationPolicy)
 		 * We can deflate if no thread is blocked on this inflated monitor (pin count is 0) and
 		 *   iff the deflation policy in effect decides it's ok.
 		 */
 		if (monitor->count == 1) {
-			if ((0 == monitor->pinCount)
-#if JAVA_SPEC_VERSION >= 24
-			&& (0 == objectMonitor->virtualThreadWaitCount)
-#endif /* JAVA_SPEC_VERSION >= 24 */
-			) {
+			if (0 == monitor->pinCount) {
 				if (deflate) {
 					deflate = 0;
 					switch (vmStruct->javaVM->thrDeflationPolicy) {
@@ -261,8 +267,8 @@ done:
 	NULL if out of memory
 	the inflated monitor, if successful
  */
-J9ObjectMonitor * 
-objectMonitorInflate(J9VMThread* vmStruct, j9object_t object, UDATA lock) 
+J9ObjectMonitor *
+objectMonitorInflate(J9VMThread* vmStruct, j9object_t object, UDATA lock)
 {
 	J9ObjectMonitor *objectMonitor = monitorTableAt(vmStruct, object);
 	omrthread_monitor_t monitor = NULL;
@@ -275,7 +281,7 @@ objectMonitorInflate(J9VMThread* vmStruct, j9object_t object, UDATA lock)
 	omrthread_monitor_enter(monitor);
 
 	/* set the count to be the current thread's count */
-	((J9ThreadAbstractMonitor*)monitor)->count = J9_FLATLOCK_COUNT(lock);	
+	((J9ThreadAbstractMonitor*)monitor)->count = J9_FLATLOCK_COUNT(lock);
 
 	if (!LN_HAS_LOCKWORD(vmStruct,object)) {
 		J9_STORE_LOCKWORD(vmStruct, &objectMonitor->alternateLockword, (j9objectmonitor_t)((UDATA)objectMonitor | OBJECT_HEADER_LOCK_INFLATED));
@@ -295,7 +301,7 @@ objectMonitorInflate(J9VMThread* vmStruct, j9object_t object, UDATA lock)
 
 
 UDATA
-objectMonitorEnter(J9VMThread* vmStruct, j9object_t object) 
+objectMonitorEnter(J9VMThread* vmStruct, j9object_t object)
 {
 	UDATA rc = objectMonitorEnterNonBlocking(vmStruct, object);
 
@@ -376,7 +382,7 @@ cancelLockReservation(J9VMThread* vmStruct)
 					compareAndSwapUDATA((uintptr_t*)lockEA, (uintptr_t)oldLock, (uintptr_t)newLock);
 				}
 
-				/* 
+				/*
 				 * CAS can only fail if another canceller has modified the lockword, in which case the
 				 * object is either no longer reserved or reserved by a different thread.
 				 * Such cases should be detected by the calling function when it re-attempts to enter the monitor.
@@ -397,13 +403,13 @@ cancelLockReservation(J9VMThread* vmStruct)
 
 /**
  * Destroy a monitor as appropriate for the given platform.
- *  For example, destroying a monitor may free the internal resources associated with the monitor. 
- *  Alternatively, destroying a monitor may return the monitor to a monitor pool for subsequent reuse. 
+ *  For example, destroying a monitor may free the internal resources associated with the monitor.
+ *  Alternatively, destroying a monitor may return the monitor to a monitor pool for subsequent reuse.
  *
  * @note A monitor must NOT be destroyed if the monitor is in use - if threads are waiting on
  * it, or if it is currently owned.
  *
- * @pre the caller must have VM access. 
+ * @pre the caller must have VM access.
  *
  * @pre Destroying a monitor modifies the hash key used by the VM's MonitorTable.
  * It must not be possible for another thread to be searching for this node in the
@@ -412,13 +418,13 @@ cancelLockReservation(J9VMThread* vmStruct)
  * thread has references to it, and the monitor is unreachable. Since the
  * monitor is marked allocated, no other thread will be attempting to reuse
  * it.
- * 
+ *
  * @param[in] vm Java VM
  * @param[in] vmThread the J9VMThread calling this function
  * @param[in] monitor a monitor to be destroyed
  * @return  0 on success or non-0 on failure (the monitor is in use)
  */
-IDATA 
+IDATA
 objectMonitorDestroy(J9JavaVM *vm, J9VMThread* vmThread, omrthread_monitor_t monitor)
 {
 	return (IDATA)omrthread_monitor_destroy_nolock(vmThread->osThread, monitor);
@@ -430,8 +436,8 @@ objectMonitorDestroy(J9JavaVM *vm, J9VMThread* vmThread, omrthread_monitor_t mon
  * @note A monitor must NOT be destroyed if the monitor is in use - if threads are waiting on
  * it, or if it is currently owned.
  *
- * @pre the caller must have VM access. 
- * 
+ * @pre the caller must have VM access.
+ *
  * @param[in] vm Java VM
  * @param[in] vmThread the J9VMThread calling this function
  */

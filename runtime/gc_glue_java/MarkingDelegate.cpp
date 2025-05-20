@@ -39,6 +39,9 @@
 #include "CollectorLanguageInterfaceImpl.hpp"
 #endif /* defined(J9VM_GC_FINALIZATION) */
 #include "ConfigurationDelegate.hpp"
+#if JAVA_SPEC_VERSION >= 24
+#include "ContinuationSlotIterator.hpp"
+#endif /* JAVA_SPEC_VERSION >= 24 */
 #include "EnvironmentDelegate.hpp"
 #include "FinalizableReferenceBuffer.hpp"
 #include "GlobalCollector.hpp"
@@ -239,14 +242,35 @@ MM_MarkingDelegate::startRootListProcessing(MM_EnvironmentBase *env)
 }
 
 void
-MM_MarkingDelegate::doStackSlot(MM_EnvironmentBase *env, omrobjectptr_t objectPtr, omrobjectptr_t *slotPtr)
+MM_MarkingDelegate::doSlot(MM_EnvironmentBase *env, omrobjectptr_t *slotPtr)
 {
-	omrobjectptr_t object = *slotPtr;
-	if (_markingScheme->isHeapObject(object) && !_extensions->heap->objectIsInGap(object)) {
-		if (_extensions->isConcurrentScavengerEnabled() && _extensions->isScavengerBackOutFlagRaised()) {
-			_markingScheme->fixupForwardedSlot(slotPtr);
-		}
-		_markingScheme->inlineMarkObject(env, *slotPtr);
+	if (_extensions->isConcurrentScavengerEnabled() && _extensions->isScavengerBackOutFlagRaised()) {
+		_markingScheme->fixupForwardedSlot(slotPtr);
+	}
+	_markingScheme->inlineMarkObject(env, *slotPtr);
+}
+
+#if JAVA_SPEC_VERSION >= 24
+void
+MM_MarkingDelegate::doContinuationSlot(MM_EnvironmentBase *env, omrobjectptr_t *slotPtr, GC_ContinuationSlotIterator *continuationSlotIterator)
+{
+	if (_markingScheme->isHeapObject(*slotPtr) && !_extensions->heap->objectIsInGap(*slotPtr)) {
+		doSlot(env, slotPtr);
+	} else if (NULL != *slotPtr) {
+		Assert_MM_true(GC_ContinuationSlotIterator::state_monitor_records == continuationSlotIterator->getState());
+	}
+}
+#endif /* JAVA_SPEC_VERSION >= 24 */
+
+void
+MM_MarkingDelegate::doStackSlot(MM_EnvironmentBase *env, omrobjectptr_t *slotPtr, void *walkState, const void* stackLocation)
+{
+	if (_markingScheme->isHeapObject(*slotPtr) && !_extensions->heap->objectIsInGap(*slotPtr)) {
+		Assert_MM_validStackSlot(MM_StackSlotValidator(0, *slotPtr, stackLocation, walkState).validate(env));
+		doSlot(env, slotPtr);
+	} else if (NULL != *slotPtr) {
+		/* stack object - just validate */
+		Assert_MM_validStackSlot(MM_StackSlotValidator(MM_StackSlotValidator::NOT_ON_HEAP, *slotPtr, stackLocation, walkState).validate(env));
 	}
 }
 
@@ -254,12 +278,30 @@ MM_MarkingDelegate::doStackSlot(MM_EnvironmentBase *env, omrobjectptr_t objectPt
  * @todo Provide function documentation
  */
 void
-stackSlotIteratorForMarkingDelegate(J9JavaVM *javaVM, J9Object **slotPtr, void *localData, J9StackWalkState *walkState, const void *stackLocation)
+MM_MarkingDelegate::stackSlotIterator(J9JavaVM *javaVM, J9Object **slotPtr, void *localData, J9StackWalkState *walkState, const void *stackLocation)
 {
-	StackIteratorData4MarkingDelegate *data = (StackIteratorData4MarkingDelegate *)localData;
-	data->markingDelegate->doStackSlot(data->env, data->fromObject, slotPtr);
+	StackIteratorData *data = (StackIteratorData *)localData;
+	data->markingDelegate->doStackSlot(data->env, slotPtr, walkState, stackLocation);
 }
 
+#if JAVA_SPEC_VERSION >= 19
+void
+MM_MarkingDelegate::scanContinuationNativeSlotsNoSync(MM_EnvironmentBase *env, J9VMThread *walkThread, J9VMContinuation *continuation, bool stackFrameClassWalkNeeded)
+{
+	J9VMThread *currentThread = (J9VMThread *)env->getLanguageVMThread();
+	StackIteratorData localData(env, this);
+
+	GC_VMThreadStackSlotIterator::scanSlots(currentThread, walkThread, continuation, (void *)&localData, (J9MODRON_OSLOTITERATOR *)stackSlotIterator, stackFrameClassWalkNeeded, false);
+
+#if JAVA_SPEC_VERSION >= 24
+	GC_ContinuationSlotIterator continuationSlotIterator(currentThread, continuation);
+
+	while (J9Object **slotPtr = continuationSlotIterator.nextSlot()) {
+		doContinuationSlot(env, slotPtr, &continuationSlotIterator);
+	}
+#endif /* JAVA_SPEC_VERSION >= 24 */
+}
+#endif /* JAVA_SPEC_VERSION >= 19 */
 
 void
 MM_MarkingDelegate::scanContinuationNativeSlots(MM_EnvironmentBase *env, omrobjectptr_t objectPtr)
@@ -270,17 +312,16 @@ MM_MarkingDelegate::scanContinuationNativeSlots(MM_EnvironmentBase *env, omrobje
 	const bool isGlobalGC = true;
 	const bool beingMounted = false;
 	if (MM_GCExtensions::needScanStacksForContinuationObject(currentThread, objectPtr, isConcurrentGC, isGlobalGC, beingMounted)) {
-		StackIteratorData4MarkingDelegate localData;
-		localData.markingDelegate = this;
-		localData.env = env;
-		localData.fromObject = objectPtr;
-
+#if JAVA_SPEC_VERSION >= 19
 		bool stackFrameClassWalkNeeded = false;
 #if defined(J9VM_GC_DYNAMIC_CLASS_UNLOADING)
 		stackFrameClassWalkNeeded = isDynamicClassUnloadingEnabled();
 #endif /* J9VM_GC_DYNAMIC_CLASS_UNLOADING */
 
-		GC_VMThreadStackSlotIterator::scanContinuationSlots(currentThread, objectPtr, (void *)&localData, stackSlotIteratorForMarkingDelegate, stackFrameClassWalkNeeded, false);
+		J9VMContinuation *continuation = J9VMJDKINTERNALVMCONTINUATION_VMREF(currentThread, objectPtr);
+		J9VMThread * const walkThread = NULL;
+		scanContinuationNativeSlotsNoSync(env, walkThread, continuation, stackFrameClassWalkNeeded);
+#endif /* JAVA_SPEC_VERSION >= 19 */
 		if (isConcurrentGC) {
 			MM_GCExtensions::exitContinuationConcurrentGCScan(currentThread, objectPtr, isGlobalGC);
 		}

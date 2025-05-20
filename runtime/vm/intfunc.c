@@ -418,6 +418,7 @@ J9InternalVMFunctions J9InternalFunctions = {
 	jvmRestoreHooks,
 	isCRaCorCRIUSupportEnabled,
 	isCRIUSupportEnabled,
+	isTimeCompensationEnabled,
 	enableCRIUSecProvider,
 	isCheckpointAllowed,
 	isNonPortableRestoreMode,
@@ -459,6 +460,8 @@ J9InternalVMFunctions J9InternalFunctions = {
 	walkAllStackFrames,
 	acquireVThreadInspector,
 	releaseVThreadInspector,
+	enterVThreadTransitionCritical,
+	exitVThreadTransitionCritical,
 #endif /* JAVA_SPEC_VERSION >= 19 */
 	checkArgsConsumed,
 #if defined(J9VM_ZOS_3164_INTEROPERABILITY) && (JAVA_SPEC_VERSION >= 17)
@@ -483,5 +486,8 @@ J9InternalVMFunctions J9InternalFunctions = {
 #if JAVA_SPEC_VERSION >= 24
 	monitorTablePeek,
 	takeVirtualThreadListToUnblock,
+	preparePinnedVirtualThreadForUnmount,
+	detachMonitorInfo,
 #endif /* JAVA_SPEC_VERSION >= 24 */
+	getSystemPropertyList,
 };

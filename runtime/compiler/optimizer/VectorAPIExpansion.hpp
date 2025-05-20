@@ -27,6 +27,7 @@
 #include "optimizer/OptimizationManager.hpp"
 #include "codegen/CodeGenerator.hpp"
 #include "codegen/RecognizedMethods.hpp"
+#include "env/VerboseLog.hpp"
 #include "il/SymbolReference.hpp"
 #include "infra/Assert.hpp"
 
@@ -241,8 +242,12 @@ class TR_VectorAPIExpansion : public TR::Optimization
       BroadcastInt,
       Convert,
       Compress,
-      Other
+      Unary,
+      Binary,
+      Ternary
       };
+
+  static const char *vapiOpCodeTypeNames[];
 
 
   /** \brief
@@ -365,19 +370,32 @@ class TR_VectorAPIExpansion : public TR::Optimization
    */
    static TR::VectorLength supportedOnPlatform(TR::Compilation *comp, vec_sz_t vectorLength)
          {
+         TR::VectorLength length;
          // General check for supported infrastructure
          if (!comp->target().cpu.isPower() &&
                !(comp->target().cpu.isZ() && comp->cg()->getSupportsVectorRegisters()) &&
                !comp->target().cpu.isARM64())
-            return TR::NoVectorLength;
+            {
+            length = TR::NoVectorLength;
+            }
+         else if (vectorLength != 128)
+            {
+            length = TR::NoVectorLength;
+            }
+         else
+            {
+            length = OMR::DataType::bitsToVectorLength(vectorLength);
 
-         if (vectorLength != 128)
-            return TR::NoVectorLength;
+            TR_ASSERT_FATAL(length > TR::NoVectorLength && length <= TR::NumVectorLengths,
+                            "VectorAPIExpansion requested invalid vector length %d\n", length);
+            }
 
-         TR::VectorLength length = OMR::DataType::bitsToVectorLength(vectorLength);
-
-         TR_ASSERT_FATAL(length > TR::NoVectorLength && length <= TR::NumVectorLengths,
-                         "VectorAPIExpansion requested invalid vector length %d\n", length);
+         if (length == TR::NoVectorLength &&
+             TR::Options::getVerboseOption(TR_VerboseVectorAPI))
+            {
+            TR_VerboseLog::writeLine(TR_Vlog_VECTOR_API, "VectorLength%d is not implemented in %s\n",
+                                  vectorLength, comp->signature());
+            }
 
          return length;
          }
@@ -1638,5 +1656,93 @@ class TR_VectorAPIExpansion : public TR::Optimization
    *      Transformed node
    */
    static TR::Node *transformNary(TR_VectorAPIExpansion *opt, TR::TreeTop *treeTop, TR::Node *node, TR::DataType elementType, TR::VectorLength vectorLength, int32_t numLanes, handlerMode mode, TR::ILOpCodes scalarOpCode, TR::ILOpCodes vectorOpCode, int32_t firstOperand, int32_t numOperands, vapiOpCodeType opCodeType, bool transformRORtoROL);
+
+  /** \brief
+   *    Checks if opcode is implemented on current platform and issues
+   *    verbose message if not
+   *
+   *   \param comp
+   *      Compilation
+   *
+   *   \param opCode
+   *      opcode
+   *
+   *   \return
+   *      opcode is supported
+   */
+   static bool isOpCodeImplemented(TR::Compilation *comp, TR::ILOpCode opCode, bool check = true)
+      {
+      bool result = check && comp->cg()->getSupportsOpCodeForAutoSIMD(opCode);
+
+      if (!result && TR::Options::getVerboseOption(TR_VerboseVectorAPI))
+         {
+         bool twoTypes = opCode.isTwoTypeVectorOpCode();
+
+         TR_VerboseLog::writeLine(TR_Vlog_VECTOR_API, "%s%s%s%s is not implemented in %s\n",
+                                  opCode.getName(),
+                                  twoTypes? TR::DataType::getName(opCode.getVectorSourceDataType()) : "",
+                                  twoTypes? "_" : "",
+                                  TR::DataType::getName(opCode.getVectorResultDataType()),
+                                  comp->signature());
+         }
+
+      return result;
+      }
+
+  /** \brief
+   *    Reports missing opcode and returns TR::BadILOp
+   *
+   *   \param comp
+   *      Compilation
+   *
+   *   \param vectorAPIOpCode
+   *      Vector API opcode number in VectorSupport.java
+   *
+   *   \param objectType
+   *      object type (Vector, Mask, Shuffle, etc.)
+   *
+   *   \param opCodeType
+   *      opcode type (Unary, Binary, etc.)
+   *
+   *   \param withMask
+   *     true if opcode is with mask
+   *
+   *   \return
+   *      TR::BadILOp
+   */
+   static TR::ILOpCodes reportMissingOpCode(TR::Compilation *comp, int32_t vectorAPIOpCode, vapiObjType objectType,
+                                     vapiOpCodeType opCodeType, bool withMask)
+      {
+      if (TR::Options::getVerboseOption(TR_VerboseVectorAPI))
+         {
+         TR_VerboseLog::writeLine(TR_Vlog_VECTOR_API, "IL is missing for vectorAPIOpCode %s %d on %s %s in %s\n",
+                                  vapiOpCodeTypeNames[opCodeType],
+                                  vectorAPIOpCode,
+                                  vapiObjTypeNames[objectType],
+                                  withMask ? "with Mask" : "",
+                                  comp->signature());
+         }
+
+      return TR::BadILOp;
+      }
+
+
+  /** \brief
+   *    Returns opcode for converting a load from a byte array into a mask
+   *
+   *   \param numLanes
+   *      Nubmer of lanes
+   *
+   *   \param maskType
+   *      Mask type
+   *
+   *   \param loadOpCode
+   *      Opcode for loading a mask from a byte array
+   *
+   *   \return
+   *      conversion opcode
+   */
+   static TR::ILOpCodes getLoadToMaskConversion(int32_t numLanes, TR::DataType maskType, TR::ILOpCodes &loadOpCode);
+
    };
 #endif /* VECTORAPIEXPANSION_INCL */

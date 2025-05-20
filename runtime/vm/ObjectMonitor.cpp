@@ -142,7 +142,10 @@ objectMonitorEnterBlocking(J9VMThread *currentThread)
 	J9Class *ramClass = J9OBJECT_CLAZZ(currentThread, object);
 	J9JavaVM *vm = currentThread->javaVM;
 	PORT_ACCESS_FROM_JAVAVM(vm);
-	I_64 startTicks = j9time_nano_time();
+	I_64 startTicks = 0;
+	if (J9_EVENT_IS_HOOKED(vm->hookInterface, J9HOOK_VM_MONITOR_CONTENDED_ENTERED)) {
+		startTicks = j9time_nano_time();
+	}
 	/* Throughout this function, note that inlineGetLockAddress cannot run into out of memory case because
 	 * an entry in monitor table will have been created by the earlier call in objectMonitorEnterNonBlocking.
 	 */
@@ -168,11 +171,18 @@ objectMonitorEnterBlocking(J9VMThread *currentThread)
 		object = NULL; // for safety, since object may be moved by the GC at various points after this
 		/* Ensure object monitor isn't deflated while we block */
 		omrthread_monitor_t monitor = objectMonitor->monitor;
+		J9VMThread *previousOwner = NULL;
+		omrthread_t previousOMRThreadOwner = ((J9ThreadMonitor *)monitor)->owner;
 		VM_AtomicSupport::add(&monitor->pinCount, 1);
 		/* Initialize our wait time to 1ms. Increase it as we have to wait more and more
 		 * using the sequence 1, 4, 16, 64 and then 64 thereafter.
 		 */
 		IDATA waitTime = 1;
+
+		if ((NULL != previousOMRThreadOwner) && !IS_J9_OBJECT_MONITOR_OWNER_DETACHED(previousOMRThreadOwner)) {
+			previousOwner = getVMThreadFromOMRThread(vm, previousOMRThreadOwner);
+		}
+
 		if (J9_EVENT_IS_HOOKED(vm->hookInterface, J9HOOK_VM_MONITOR_CONTENDED_ENTER)) {
 			bool frameBuilt = saveBlockingEnterObject(currentThread);
 			VM_VMAccess::setPublicFlags(currentThread, J9_PUBLIC_FLAGS_THREAD_BLOCKED);
@@ -291,9 +301,8 @@ done:
 		((J9ThreadMonitor*)monitor)->flags &= ~(UDATA)J9THREAD_MONITOR_SUPPRESS_CONTENDED_EXIT;
 		VM_AtomicSupport::subtract(&monitor->pinCount, 1);
 		if (J9_EVENT_IS_HOOKED(vm->hookInterface, J9HOOK_VM_MONITOR_CONTENDED_ENTERED)) {
-			J9VMThread *ownerThread = getVMThreadFromOMRThread(vm, ((J9ThreadMonitor *)monitor)->owner);
 			bool frameBuilt = saveBlockingEnterObject(currentThread);
-			ALWAYS_TRIGGER_J9HOOK_VM_MONITOR_CONTENDED_ENTERED(vm->hookInterface, currentThread, monitor, startTicks, ramClass, ownerThread);
+			ALWAYS_TRIGGER_J9HOOK_VM_MONITOR_CONTENDED_ENTERED(vm->hookInterface, currentThread, monitor, startTicks, ramClass, previousOwner);
 			restoreBlockingEnterObject(currentThread, frameBuilt);
 		}
 	}

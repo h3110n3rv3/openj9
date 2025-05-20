@@ -220,6 +220,7 @@ synchronizeWithConcurrentGCScan(J9VMThread *currentThread, j9object_t continuati
 BOOLEAN
 enterContinuation(J9VMThread *currentThread, j9object_t continuationObject)
 {
+	J9JavaVM *vm = currentThread->javaVM;
 	BOOLEAN result = TRUE;
 	J9VMContinuation *continuation = J9VMJDKINTERNALVMCONTINUATION_VMREF(currentThread, continuationObject);
 	ContinuationState volatile *continuationStatePtr = VM_ContinuationHelpers::getContinuationStateAddress(currentThread, continuationObject);
@@ -232,7 +233,7 @@ enterContinuation(J9VMThread *currentThread, j9object_t continuationObject)
 			/* Directly return result if the create code failed, exception is already set. */
 			return result;
 		}
-		currentThread->javaVM->memoryManagerFunctions->continuationObjectStarted(currentThread, continuationObject);
+		vm->memoryManagerFunctions->continuationObjectStarted(currentThread, continuationObject);
 
 		continuation = J9VMJDKINTERNALVMCONTINUATION_VMREF(currentThread, continuationObject);
 #if JAVA_SPEC_VERSION >= 24
@@ -240,6 +241,16 @@ enterContinuation(J9VMThread *currentThread, j9object_t continuationObject)
 #endif /* JAVA_SPEC_VERSION >= 24 */
 	}
 	Assert_VM_notNull(continuation);
+
+#if JAVA_SPEC_VERSION >= 24
+	if (started && (J9VM_CONTINUATION_RETURN_FROM_YIELD != continuation->returnState)) {
+		/* Continuation is still in a blocked list. This can happen with TIMED_WAIT.
+		 * It must be removed from the waiting list.
+		 */
+		bool errorNone = VM_ContinuationHelpers::removeBlockingContinuationFromLists(currentThread, continuation);
+		Assert_VM_true(errorNone);
+	}
+#endif /* JAVA_SPEC_VERSION >= 24 */
 
 	/* let GC know we are mounting, so they don't need to scan us, or if there is already ongoing scan wait till it's complete. */
 	continuationObject = synchronizeWithConcurrentGCScan(currentThread, continuationObject, continuationStatePtr);
@@ -262,10 +273,14 @@ enterContinuation(J9VMThread *currentThread, j9object_t continuationObject)
 	if (started) {
 #if JAVA_SPEC_VERSION >= 24
 		if (J9_ARE_ANY_BITS_SET(currentThread->javaVM->extendedRuntimeFlags3, J9_EXTENDED_RUNTIME3_YIELD_PINNED_CONTINUATION)) {
-			preparePinnedVirtualThreadForMount(currentThread, continuationObject);
-
+			preparePinnedVirtualThreadForMount(currentThread, continuationObject, (J9VM_CONTINUATION_RETURN_FROM_OBJECT_WAIT == continuation->returnState));
 		}
-		VM_OutOfLineINL_Helpers::restoreInternalNativeStackFrame(currentThread);
+		/* InternalNative frame only build for INL calls (yield and wait). */
+		if ((J9VM_CONTINUATION_RETURN_FROM_YIELD == continuation->returnState)
+			|| (J9VM_CONTINUATION_RETURN_FROM_OBJECT_WAIT == continuation->returnState)
+		) {
+			VM_OutOfLineINL_Helpers::restoreInternalNativeStackFrame(currentThread);
+		}
 		result = FALSE;
 #else /* JAVA_SPEC_VERSION >= 24 */
 		/* resuming Continuation from yieldImpl */
@@ -364,6 +379,11 @@ freeContinuation(J9VMThread *currentThread, j9object_t continuationObject, BOOLE
 #if JAVA_SPEC_VERSION >= 24
 		/* Remove reverse link to vthread object. */
 		continuation->vthread = NULL;
+
+		if (NULL != continuation->objectWaitMonitor) {
+			bool errorNone = VM_ContinuationHelpers::removeBlockingContinuationFromLists(currentThread, continuation);
+			Assert_VM_true(errorNone);
+		}
 		Assert_VM_true(NULL == continuation->nextWaitingContinuation);
 #endif /* JAVA_SPEC_VERSION >= 24 */
 		/* Free old stack used by continuation. */
@@ -448,13 +468,17 @@ isPinnedContinuation(J9VMThread *currentThread)
 
 	if (currentThread->continuationPinCount > 0) {
 		result = J9VM_CONTINUATION_PINNED_REASON_CRITICAL_SECTION;
-	} else if (currentThread->ownedMonitorCount > 0) {
-		result = J9VM_CONTINUATION_PINNED_REASON_MONITOR;
 	} else if (currentThread->callOutCount > 0) {
 		/* TODO: This check should be changed from > 1 to > 0 once the call-ins are no
 		 * longer used and the new design for single cInterpreter is implemented.
 		 */
 		result = J9VM_CONTINUATION_PINNED_REASON_NATIVE;
+	} else if ((currentThread->ownedMonitorCount > 0)
+#if JAVA_SPEC_VERSION >= 24
+	&& J9_ARE_NO_BITS_SET(currentThread->javaVM->extendedRuntimeFlags3, J9_EXTENDED_RUNTIME3_YIELD_PINNED_CONTINUATION)
+#endif /* JAVA_SPEC_VERSION >= 24 */
+	) {
+		result = J9VM_CONTINUATION_PINNED_REASON_MONITOR;
 	} else {
 		/* Do nothing. */
 	}
@@ -508,6 +532,8 @@ walkContinuationStackFrames(J9VMThread *currentThread, J9VMContinuation *continu
 
 		copyFieldsFromContinuation(currentThread, &stackThread, &els, continuation);
 		stackThread.threadObject = threadObject;
+		/* stackThread is "fake thread" there is no related omrThread and currentContinuation, so reuse stackThread.currentContinuation for recording relate walk continuation structure. */
+		stackThread.currentContinuation = continuation;
 		walkState->walkThread = &stackThread;
 		rc = currentThread->javaVM->walkStackFrames(currentThread, walkState);
 	}
@@ -661,13 +687,103 @@ releaseVThreadInspector(J9VMThread *currentThread, jobject thread)
 	}
 }
 
-#if JAVA_SPEC_VERSION >= 24
 void
-detachMonitorInfo(J9VMThread *currentThread, J9ObjectMonitor *objectMonitor)
+enterVThreadTransitionCritical(J9VMThread *currentThread, jobject thread)
 {
+	J9JavaVM *vm = currentThread->javaVM;
+	J9InternalVMFunctions *vmFuncs = vm->internalVMFunctions;
+	MM_ObjectAccessBarrierAPI objectAccessBarrier = MM_ObjectAccessBarrierAPI(currentThread);
+	j9object_t threadObj = J9_JNI_UNWRAP_REFERENCE(thread);
+
+retry:
+	if (!VM_VMHelpers::isThreadSuspended(currentThread, threadObj)) {
+		while (!objectAccessBarrier.inlineMixedObjectCompareAndSwapU64(currentThread, threadObj, vm->virtualThreadInspectorCountOffset, 0, ~(U_64)0)) {
+			/* Thread is being inspected or unmounted, wait. */
+			vmFuncs->internalReleaseVMAccess(currentThread);
+			VM_AtomicSupport::yieldCPU();
+			/* After wait, the thread may suspend here. */
+			vmFuncs->internalAcquireVMAccess(currentThread);
+			threadObj = J9_JNI_UNWRAP_REFERENCE(thread);
+		}
+
+		/* Now we have locked access to virtualThreadInspectorCount, check if the vthread is suspended.
+		* If suspended, release the access and spin-wait until the vthread is resumed.
+		* If not suspended, link the current J9VMThread with the virtual thread object.
+		*/
+		if (!VM_VMHelpers::isThreadSuspended(currentThread, threadObj)
+		&& objectAccessBarrier.inlineMixedObjectCompareAndSwapU64(currentThread, threadObj, vm->internalSuspendStateOffset, J9_VIRTUALTHREAD_INTERNAL_STATE_NONE, (U_64)currentThread)
+		) {
+			return;
+		}
+		J9OBJECT_I64_STORE(currentThread, threadObj, vm->virtualThreadInspectorCountOffset, 0);
+	}
+	vmFuncs->internalReleaseVMAccess(currentThread);
+	/* Spin is used instead of the halt flag as we cannot guarantee suspend flag is still set now.
+	*
+	* TODO: Dynamically increase the sleep time to a bounded maximum.
+	*/
+	j9thread_sleep(10);
+	/* After wait, the thread may suspend here. */
+	vmFuncs->internalAcquireVMAccess(currentThread);
+	threadObj = J9_JNI_UNWRAP_REFERENCE(thread);
+	goto retry;
+}
+
+void
+exitVThreadTransitionCritical(J9VMThread *currentThread, jobject thread)
+{
+	J9JavaVM *vm = currentThread->javaVM;
+	J9InternalVMFunctions *vmFuncs = vm->internalVMFunctions;
+	j9object_t vthread = J9_JNI_UNWRAP_REFERENCE(thread);
+	MM_ObjectAccessBarrierAPI objectAccessBarrier = MM_ObjectAccessBarrierAPI(currentThread);
+
+	/* Remove J9VMThread address from internalSuspendedState field, as the thread state is no longer in a transition. */
+	while (!objectAccessBarrier.inlineMixedObjectCompareAndSwapU64(currentThread, vthread, vm->internalSuspendStateOffset, (U_64)currentThread, J9_VIRTUALTHREAD_INTERNAL_STATE_NONE)) {
+		/* Wait if the suspend flag is set. */
+		vmFuncs->internalReleaseVMAccess(currentThread);
+		VM_AtomicSupport::yieldCPU();
+		/* After wait, the thread may suspend here. */
+		vmFuncs->internalAcquireVMAccess(currentThread);
+		vthread = J9_JNI_UNWRAP_REFERENCE(thread);
+	}
+
+	/* Update to virtualThreadInspectorCount must be after clearing isSuspendedInternal field to retain sync ordering. */
+	Assert_VM_true(-1 == J9OBJECT_I64_LOAD(currentThread, vthread, vm->virtualThreadInspectorCountOffset));
+	J9OBJECT_I64_STORE(currentThread, vthread, vm->virtualThreadInspectorCountOffset, 0);
+}
+
+#if JAVA_SPEC_VERSION >= 24
+J9ObjectMonitor *
+detachMonitorInfo(J9VMThread *currentThread, j9object_t lockObject)
+{
+	J9ObjectMonitor *objectMonitor = NULL;
+	j9objectmonitor_t lock = 0;
+
+	if (!LN_HAS_LOCKWORD(currentThread, lockObject)) {
+		objectMonitor = monitorTablePeek(currentThread->javaVM, lockObject);
+		if (NULL != objectMonitor) {
+			lock = J9_LOAD_LOCKWORD(currentThread, &objectMonitor->alternateLockword);
+		} else {
+			lock = 0;
+		}
+	} else {
+		lock = J9OBJECT_MONITOR(currentThread, lockObject);
+	}
+
+	if (!J9_LOCK_IS_INFLATED(lock)) {
+		objectMonitor = objectMonitorInflate(currentThread, lockObject, lock);
+		if (NULL == objectMonitor) {
+			return NULL;
+		}
+	} else {
+		objectMonitor = J9_INFLLOCK_OBJECT_MONITOR(lock);
+	}
+
 	J9ThreadAbstractMonitor *monitor = (J9ThreadAbstractMonitor *)objectMonitor->monitor;
-	monitor->owner = (J9Thread*)1;
+	monitor->owner = (J9Thread *)J9_OBJECT_MONITOR_OWNER_DETACHED;
 	objectMonitor->ownerContinuation = currentThread->currentContinuation;
+
+	return objectMonitor;
 }
 
 void
@@ -678,54 +794,121 @@ updateMonitorInfo(J9VMThread *currentThread, J9ObjectMonitor *objectMonitor)
 	objectMonitor->ownerContinuation = NULL;
 }
 
-void
-preparePinnedVirtualThreadForMount(J9VMThread *currentThread, j9object_t continuationObject)
+UDATA
+walkFrameMonitorEnterRecords(J9VMThread *currentThread, J9StackWalkState *walkState)
 {
-	UDATA monitorCount = 0;
-	if (0 < currentThread->ownedMonitorCount) {
-		/* Inflate all owned monitors. */
-		J9MonitorEnterRecord *monitorRecords = currentThread->monitorEnterRecords;
-		while (NULL != monitorRecords) {
-			j9object_t object = monitorRecords->object;
-			j9objectmonitor_t lock = 0;
-			J9ObjectMonitor *objectMonitor = NULL;
+	J9MonitorEnterRecord *monitorEnterRecords = (J9MonitorEnterRecord*)walkState->userData3;
+	J9ObjectMonitor *objMonitorHead = (J9ObjectMonitor*)walkState->userData1;
+	j9object_t targetSyncObject = (j9object_t)walkState->userData2;
+	UDATA monitorCount = (UDATA)walkState->userData4;
+	U_32 modifiers;
+	UDATA *frameID;
 
-			if (!LN_HAS_LOCKWORD(currentThread, object)) {
-				objectMonitor = monitorTablePeek(currentThread->javaVM, object);
-			} else {
-				lock = J9OBJECT_MONITOR(currentThread, object);
-				objectMonitor = J9_INFLLOCK_OBJECT_MONITOR(lock);
+	frameID = walkState->arg0EA;
+#ifdef J9VM_INTERP_NATIVE_SUPPORT
+	if (walkState->jitInfo != NULL) {
+		frameID = walkState->unwindSP;
+	}
+#endif
+
+	while (monitorEnterRecords &&
+			(frameID == CONVERT_FROM_RELATIVE_STACK_OFFSET(walkState->walkThread, monitorEnterRecords->arg0EA))
+		) {
+		j9object_t obj = monitorEnterRecords->object;
+		if (obj != targetSyncObject) {
+			J9ObjectMonitor *mon = detachMonitorInfo(currentThread, obj);
+			if (NULL == mon) {
+				return J9_STACKWALK_RC_NO_MEMORY;
 			}
-
-			updateMonitorInfo(currentThread, objectMonitor);
+			mon->next = objMonitorHead;
+			objMonitorHead = mon;
 			monitorCount++;
-			monitorRecords = monitorRecords->next;
+		}
+		monitorEnterRecords = monitorEnterRecords->next;
+	}
+
+	/* If the current method is synchronized, add the syncObject to the array. */
+	modifiers = J9_ROM_METHOD_FROM_RAM_METHOD(walkState->method)->modifiers;
+	if (modifiers & J9AccSynchronized) {
+		j9object_t syncObject;
+
+		if ((modifiers & J9AccNative)
+#ifdef J9VM_INTERP_NATIVE_SUPPORT
+			|| (walkState->jitInfo != NULL)
+#endif
+		) {
+			if (modifiers & J9AccStatic) {
+				syncObject = J9VM_J9CLASS_TO_HEAPCLASS(walkState->constantPool->ramClass);
+			} else {
+				syncObject = *((j9object_t *) walkState->arg0EA);
+			}
+		} else {
+			syncObject = (j9object_t) (walkState->bp[1]);
 		}
 
-		/* Repeat for JNI monitor records. */
-		monitorRecords = currentThread->jniMonitorEnterRecords;
-		while (NULL != monitorRecords) {
-			j9object_t object = monitorRecords->object;
-			j9objectmonitor_t lock = 0;
-			J9ObjectMonitor *objectMonitor = NULL;
-
-			if (!LN_HAS_LOCKWORD(currentThread, object)) {
-				objectMonitor = monitorTablePeek(currentThread->javaVM, object);
-			} else {
-				lock = J9OBJECT_MONITOR(currentThread, object);
-				objectMonitor = J9_INFLLOCK_OBJECT_MONITOR(lock);
+		if (syncObject != targetSyncObject) {
+			J9ObjectMonitor *mon = detachMonitorInfo(currentThread, syncObject);
+			if (NULL == mon) {
+				return J9_STACKWALK_RC_NO_MEMORY;
 			}
-
-			updateMonitorInfo(currentThread, objectMonitor);
+			mon->next = objMonitorHead;
+			objMonitorHead = mon;
 			monitorCount++;
-			monitorRecords = monitorRecords->next;
 		}
 	}
 
-	J9VMJDKINTERNALVMCONTINUATION_SET_BLOCKER(currentThread, continuationObject, NULL);
+	walkState->userData1 = objMonitorHead;
+	walkState->userData3 = monitorEnterRecords;
+	walkState->userData4 = (void*)monitorCount;
+	return J9_STACKWALK_KEEP_ITERATING;
+}
+
+UDATA
+ownedMonitorsIterator(J9VMThread *currentThread, J9StackWalkState *walkState)
+{
+	UDATA rc = J9_STACKWALK_KEEP_ITERATING;
+
+	/* Take the J9JavaVM from the targetThread as currentThread may be null. */
+	J9JavaVM* javaVM = walkState->walkThread->javaVM;
+#ifdef J9VM_INTERP_NATIVE_SUPPORT
+	if (walkState->jitInfo) {
+		/* The jit walk may increment/decrement the stack depth */
+		rc = javaVM->jitGetOwnedObjectMonitors(walkState);
+	} else
+#endif
+	{
+		/* The walk function may decrement the stack depth if a hidden frame is skipped */
+		rc = walkFrameMonitorEnterRecords(currentThread, walkState);
+	}
+
+	return rc;
+}
+
+void
+preparePinnedVirtualThreadForMount(J9VMThread *currentThread, j9object_t continuationObject, BOOLEAN isObjectWait)
+{
+	UDATA monitorCount = 0;
+
+	if (currentThread->ownedMonitorCount > 0) {
+		/* Update all owned monitors. */
+		J9ObjectMonitor *head = currentThread->currentContinuation->enteredMonitors;
+		while (NULL != head) {
+			updateMonitorInfo(currentThread, head);
+			monitorCount++;
+			J9ObjectMonitor *next = head->next;
+			head->next = NULL;
+			head = next;
+		}
+		currentThread->currentContinuation->enteredMonitors = NULL;
+	}
+	Assert_VM_true(monitorCount <= currentThread->ownedMonitorCount);
 
 	/* Add the attached monitor to the carrier thread's lockedmonitorcount. */
 	currentThread->osThread->lockedmonitorcount += monitorCount;
+	if (J9VM_CONTINUATION_RETURN_FROM_YIELD != currentThread->currentContinuation->returnState) {
+		VM_VMHelpers::virtualThreadHideFrames(currentThread, JNI_FALSE);
+		exitVThreadTransitionCritical(currentThread, (jobject)&currentThread->threadObject);
+	}
 }
 
 UDATA
@@ -733,122 +916,243 @@ preparePinnedVirtualThreadForUnmount(J9VMThread *currentThread, j9object_t syncO
 {
 	UDATA result = J9_OBJECT_MONITOR_YIELD_VIRTUAL;
 	J9ObjectMonitor *syncObjectMonitor = NULL;
-	j9objectmonitor_t lock = 0;
-	j9object_t continuationObj = NULL;
+	J9ObjectMonitor *enteredMonitorsList = NULL;
 	UDATA monitorCount = 0;
+	J9JavaVM *vm = currentThread->javaVM;
+	J9VMContinuation *continuation = currentThread->currentContinuation;
 
-	if (0 < currentThread->ownedMonitorCount) {
-		/* Inflate all owned monitors. */
-		J9MonitorEnterRecord *monitorRecords = currentThread->monitorEnterRecords;
-		while (NULL != monitorRecords) {
-			j9object_t object = monitorRecords->object;
-			J9ObjectMonitor *objectMonitor = NULL;
+	if (NULL != syncObj) {
+		j9objectmonitor_t volatile *lwEA = VM_ObjectMonitor::inlineGetLockAddress(currentThread, syncObj);
+		j9objectmonitor_t lock = J9_LOAD_LOCKWORD(currentThread, lwEA);
+		omrthread_monitor_t monitor = NULL;
 
-			if (!LN_HAS_LOCKWORD(currentThread, object)) {
-				objectMonitor = monitorTablePeek(currentThread->javaVM, object);
-				if (NULL != objectMonitor) {
-					lock = J9_LOAD_LOCKWORD(currentThread, &objectMonitor->alternateLockword);
-				} else {
-					lock = 0;
-				}
-			} else {
-				lock = J9OBJECT_MONITOR(currentThread, object);
-			}
-
-			if (!J9_LOCK_IS_INFLATED(lock)) {
-				objectMonitor = objectMonitorInflate(currentThread, object, lock);
-				if (NULL == objectMonitor) {
-					result = J9_OBJECT_MONITOR_OOM;
-					goto done;
-				}
-			}
-
-			detachMonitorInfo(currentThread, objectMonitor);
-			monitorCount++;
-			monitorRecords = monitorRecords->next;
-		}
-
-		/* Repeat for JNI monitor records. */
-		monitorRecords = currentThread->jniMonitorEnterRecords;
-		while (NULL != monitorRecords) {
-			j9object_t object = monitorRecords->object;
-			J9ObjectMonitor *objectMonitor = NULL;
-
-			if (!LN_HAS_LOCKWORD(currentThread, object)) {
-				objectMonitor = monitorTablePeek(currentThread->javaVM, object);
-				if (NULL != objectMonitor) {
-					lock = J9_LOAD_LOCKWORD(currentThread, &objectMonitor->alternateLockword);
-				} else {
-					lock = 0;
-				}
-			} else {
-				lock = J9OBJECT_MONITOR(currentThread, object);
-			}
-
-			if (!J9_LOCK_IS_INFLATED(lock)) {
-				objectMonitor = objectMonitorInflate(currentThread, object, lock);
-				if (NULL == objectMonitor) {
-					result = J9_OBJECT_MONITOR_OOM;
-					goto done;
-				}
-			}
-
-			detachMonitorInfo(currentThread, objectMonitor);
-			monitorCount++;
-			monitorRecords = monitorRecords->next;
-		}
-	}
-
-	if (!LN_HAS_LOCKWORD(currentThread, syncObj)) {
-		syncObjectMonitor = monitorTablePeek(currentThread->javaVM, syncObj);
-		if (NULL != syncObjectMonitor) {
-			lock = J9_LOAD_LOCKWORD(currentThread, &syncObjectMonitor->alternateLockword);
+		if (J9_LOCK_IS_INFLATED(lock)) {
+			syncObjectMonitor = J9_INFLLOCK_OBJECT_MONITOR(lock);
 		} else {
-			lock = 0;
+			if (isObjectWait) {
+				syncObjectMonitor = objectMonitorInflate(currentThread, syncObj, lock);
+				if (NULL == syncObjectMonitor) {
+					result = J9_OBJECT_MONITOR_OOM;
+					goto done;
+				}
+			} else {
+				/* This must be a monitor enter case, so this implies that a monitor entry was
+				 * created as the non-blocking path would have failed.
+				 * Since a monitor can only be inflated by a thread that owns it, we can't directly
+				 * inflate the blocking monitor.
+				 */
+restart:
+#if defined(J9VM_THR_LOCK_RESERVATION)
+				{
+					while (OBJECT_HEADER_LOCK_RESERVED == (lock & (OBJECT_HEADER_LOCK_RESERVED | OBJECT_HEADER_LOCK_INFLATED))) {
+						cancelLockReservation(currentThread);
+						/* Calculate the new lock word, since the object may have moved. */
+						syncObj = J9VMTHREAD_BLOCKINGENTEROBJECT(currentThread, currentThread);
+						lwEA = VM_ObjectMonitor::inlineGetLockAddress(currentThread, syncObj);
+						lock = J9_LOAD_LOCKWORD(currentThread, lwEA);
+						if (VM_ObjectMonitor::inlineFastInitAndEnterMonitor(currentThread, lwEA)) {
+							result = (UDATA)syncObj;
+							goto success;
+						}
+					}
+				}
+#endif /* J9VM_THR_LOCK_RESERVATION */
+				syncObjectMonitor = monitorTableAt(currentThread, syncObj);
+				monitor = syncObjectMonitor->monitor;
+
+				if (J9_EVENT_IS_HOOKED(vm->hookInterface, J9HOOK_VM_MONITOR_CONTENDED_ENTERED)
+					&& J9_ARE_NO_BITS_SET(continuation->runtimeFlags, J9VM_CONTINUATION_RUNTIMEFLAG_JVMTI_CONTENDED_MONITOR_ENTER_RECORDED)
+				) {
+					/* Get owner here since it could be too late within yieldPinnedContinuation(). */
+					if (IS_J9_OBJECT_MONITOR_OWNER_DETACHED(monitor->owner)) {
+						continuation->previousOwner = NULL;
+					} else {
+						continuation->previousOwner = getVMThreadFromOMRThread(vm, ((J9ThreadMonitor *)monitor)->owner);
+					}
+				}
+
+				/* Try acquire the inflated monitor */
+				if (0 == omrthread_monitor_try_enter(monitor)) {
+					/* If the INFLATED bit is set, then it is already inflated and we own the object monitor. */
+					if (J9_ARE_ANY_BITS_SET(((J9ThreadMonitor *)monitor)->flags, J9THREAD_MONITOR_INFLATED)) {
+						currentThread->ownedMonitorCount += 1;
+						result = (UDATA)syncObj;
+						goto success;
+					}
+
+					/* Loop until either lock is inflated or FLC bit is set. */
+					while (!J9_LOCK_IS_INFLATED(lock)) {
+						/* The monitor isn't inflated yet, but we can update the lockword now. */
+						UDATA newLockword = 0;
+						UDATA count = J9_FLATLOCK_COUNT(lock);
+						if (0 == count) {
+							/* Lock is unlocked, so try to directly acquire it as a flatlock. */
+							newLockword = (UDATA)currentThread;
+						} else {
+							/* Change the lock to flat with FLC bit set so it will be inflated during exit. */
+							newLockword = (UDATA)J9_FLATLOCK_OWNER(lock)
+										| ((count - 1) << OBJECT_HEADER_LOCK_V2_RECURSION_OFFSET)
+										| OBJECT_HEADER_LOCK_FLC;
+						}
+						j9objectmonitor_t const oldValue = lock;
+						lock = VM_ObjectMonitor::compareAndSwapLockword(currentThread, lwEA, lock, (j9objectmonitor_t)newLockword);
+						if (lock == oldValue) {
+							/* CAS succeeded, we can proceed with using the inflated monitor. */
+							VM_ObjectMonitor::incrementCancelCounter(J9OBJECT_CLAZZ(currentThread, syncObj));
+							/* Either the lock is acquired or FLC bit set, safe to release the inflated monitor. */
+							omrthread_monitor_exit(monitor);
+
+							if (J9_FLATLOCK_OWNER(lock) == currentThread) {
+								/* Lock is acquired. */
+								currentThread->ownedMonitorCount += 1;
+								result = (UDATA)syncObj;
+								goto success;
+							}
+							break;
+#if defined(J9VM_THR_LOCK_RESERVATION)
+						} else if (OBJECT_HEADER_LOCK_RESERVED == (lock & (OBJECT_HEADER_LOCK_RESERVED | OBJECT_HEADER_LOCK_INFLATED))) {
+							/* Lock is now reserved, exit the inflated monitor and restart to cancel lock reservation. */
+							omrthread_monitor_exit(monitor);
+							goto restart;
+#endif /* J9VM_THR_LOCK_RESERVATION */
+						}
+						/* CAS failed, another thread must have updated the lockword, retry the check. */
+					}
+				} else {
+					/* Inflated monitor owned by another thread, so the lockword update will be completed by them. */
+					lock = J9_LOAD_LOCKWORD(currentThread, lwEA);
+					/* We can safely continue if the lock is inflated or FLC bit is set. */
+					if (0 == (lock & (OBJECT_HEADER_LOCK_FLC | OBJECT_HEADER_LOCK_INFLATED))) {
+						goto restart;
+					}
+				}
+			}
 		}
-	} else {
-		lock = J9OBJECT_MONITOR(currentThread, syncObj);
 	}
 
-	if (!J9_LOCK_IS_INFLATED(lock)) {
-		syncObjectMonitor = objectMonitorInflate(currentThread, syncObj, lock);
-		if (NULL == syncObjectMonitor) {
+	/* Walk all owned monitors and detach from current carrier thread. */
+	if (currentThread->ownedMonitorCount > 0) {
+		J9StackWalkState walkState;
+
+		walkState.userData1 = NULL;
+		walkState.userData2 = syncObj;
+
+		walkState.userData3 = currentThread->monitorEnterRecords;
+		walkState.userData4 = (void *)0;
+		walkState.walkThread = currentThread;
+		walkState.skipCount = 0;
+		walkState.flags = J9_STACKWALK_VISIBLE_ONLY
+			| J9_STACKWALK_SKIP_INLINES
+			| J9_STACKWALK_ITERATE_FRAMES
+			| J9_STACKWALK_NO_ERROR_REPORT
+			| J9_STACKWALK_PREPARE_FOR_YIELD;
+
+		walkState.frameWalkFunction = ownedMonitorsIterator;
+
+		if (vm->walkStackFrames(currentThread, &walkState) != J9_STACKWALK_RC_NONE) {
 			result = J9_OBJECT_MONITOR_OOM;
 			goto done;
 		}
+
+		enteredMonitorsList = (J9ObjectMonitor*)walkState.userData1;
+		monitorCount = (UDATA)walkState.userData4;
+
+		/* Inflate all owned monitors. */
+		/* Repeat for JNI monitor records. */
+		J9MonitorEnterRecord *monitorRecords = currentThread->jniMonitorEnterRecords;
+		while (NULL != monitorRecords) {
+			j9object_t object = monitorRecords->object;
+
+			if (syncObj != object) {
+				J9ObjectMonitor *objectMonitor = detachMonitorInfo(currentThread, object);
+				if (NULL == objectMonitor) {
+					result = J9_OBJECT_MONITOR_OOM;
+					goto done;
+				}
+				objectMonitor->next = enteredMonitorsList;
+				enteredMonitorsList = objectMonitor;
+				monitorCount++;
+			}
+			monitorRecords = monitorRecords->next;
+		}
+		continuation->enteredMonitors = enteredMonitorsList;
 	}
+	Assert_VM_true(monitorCount <= currentThread->ownedMonitorCount);
 
-	continuationObj = J9VMJAVALANGVIRTUALTHREAD_CONT(currentThread, currentThread->threadObject);
-	J9VMJDKINTERNALVMCONTINUATION_SET_BLOCKER(currentThread, continuationObj, syncObj);
-
-	if (isObjectWait) {
-		J9VMContinuation *continuation = currentThread->currentContinuation;
+	if (NULL != syncObj) {
+		j9object_t continuationObj = J9VMJAVALANGVIRTUALTHREAD_CONT(currentThread, currentThread->threadObject);
 		omrthread_monitor_t monitor = syncObjectMonitor->monitor;
+		J9VMJDKINTERNALVMCONTINUATION_SET_BLOCKER(currentThread, continuationObj, syncObj);
+		continuation->objectWaitMonitor = syncObjectMonitor;
 
-		/* Record wait monitor state. */
-		continuation->waitingMonitorEnterCount = monitor->count;
+		if (isObjectWait) {
+			/* Record wait monitor state. */
+			continuation->waitingMonitorEnterCount = monitor->count;
 
-		/* Reset monitor entry count to 1.*/
-		monitor->count = 1;
+			/* Reset monitor entry count to 1.*/
+			monitor->count = 1;
+			/* Reset monitor state to pre-detach state so omrthread_monitor_exit behave correctly. */
+			monitor->owner = currentThread->osThread;
+			syncObjectMonitor->ownerContinuation = NULL;
 
-		/* Add Continuation struct to the monitor's waiting list. */
-		omrthread_monitor_exit(monitor);
-		omrthread_monitor_enter(currentThread->javaVM->blockedVirtualThreadsMutex);
-		currentThread->currentContinuation->nextWaitingContinuation = syncObjectMonitor->waitingContinuations;
-		syncObjectMonitor->waitingContinuations = currentThread->currentContinuation;
-		omrthread_monitor_exit(currentThread->javaVM->blockedVirtualThreadsMutex);
-	} else {
-		syncObjectMonitor->virtualThreadWaitCount += 1;
+			/* Add Continuation struct to the monitor's waiting list. */
+			currentThread->ownedMonitorCount -= continuation->waitingMonitorEnterCount;
+
+			omrthread_monitor_enter(vm->blockedVirtualThreadsMutex);
+			continuation->nextWaitingContinuation = syncObjectMonitor->waitingContinuations;
+			syncObjectMonitor->waitingContinuations = continuation;
+			omrthread_monitor_exit(vm->blockedVirtualThreadsMutex);
+
+			omrthread_monitor_exit(monitor);
+		} else {
+			if (NULL != monitor) {
+				/* If we are blocking to wait on a contended monitor then we can't be the owner. */
+				Assert_VM_false(monitor->owner == currentThread->osThread);
+			}
+		}
 	}
 
-	/* Subtract the detached monitor from the carrier thread's lockedmonitorcount. */
+	/* Subtract the detached monitors from the carrier thread's lockedmonitorcount. */
 	currentThread->osThread->lockedmonitorcount -= monitorCount;
 
+done:
+	if (NULL != syncObj) {
+		if (J9_OBJECT_MONITOR_YIELD_VIRTUAL != result) {
+			VM_VMHelpers::virtualThreadHideFrames(currentThread, JNI_FALSE);
+			exitVThreadTransitionCritical(currentThread, (jobject)&currentThread->threadObject);
+		}
+	}
+success:
 	/* Clear the blocking object on the carrier thread. */
 	J9VMTHREAD_SET_BLOCKINGENTEROBJECT(currentThread, currentThread, NULL);
 
-done:
 	return result;
+}
+
+static VMINLINE void
+waitForSignal(J9VMThread *currentThread)
+{
+	J9JavaVM *vm = currentThread->javaVM;
+	J9InternalVMFunctions *vmFuncs = vm->internalVMFunctions;
+
+	/* In all other cases when VM Access and blockedVirtualThreadsMutex are both held
+	 * VM Access is acquired first so we should be consistent here as well otherwise
+	 * we risk deadlocks. Since wait internally acquires the monitor we should release the
+	 * lock once notified and re-acquire after we acquire VM access. While the monitor
+	 * exit before the VM access release isn't strictly needed I've done it for symmetry.
+	 *
+	 * TODO we should consider refactoring all other uses of blockedVirtualThreadsMutex
+	 * such that VM access is not held while the lock is held. There are complexities involved
+	 * as in many of those cases the method has direct references to objects and it may not
+	 * be trivial to build an object frame to store them when VM access is released.
+	 */
+	omrthread_monitor_exit(vm->blockedVirtualThreadsMutex);
+	vmFuncs->internalExitVMToJNI(currentThread);
+	omrthread_monitor_enter(vm->blockedVirtualThreadsMutex);
+	omrthread_monitor_wait_interruptable(vm->blockedVirtualThreadsMutex, 0, 0);
+	omrthread_monitor_exit(vm->blockedVirtualThreadsMutex);
+	vmFuncs->internalEnterVMFromJNI(currentThread);
+	omrthread_monitor_enter(vm->blockedVirtualThreadsMutex);
 }
 
 jobject
@@ -859,70 +1163,115 @@ takeVirtualThreadListToUnblock(J9VMThread *currentThread)
 	J9JavaVM *vm = currentThread->javaVM;
 	J9InternalVMFunctions const * const vmFuncs = vm->internalVMFunctions;
 
-	if (J9_ARE_ANY_BITS_SET(vm->extendedRuntimeFlags3, J9_EXTENDED_RUNTIME3_YIELD_PINNED_CONTINUATION)
+	if (J9_ARE_NO_BITS_SET(vm->extendedRuntimeFlags3, J9_EXTENDED_RUNTIME3_YIELD_PINNED_CONTINUATION)
 	|| (NULL == vm->blockedContinuations)
 	) {
 		return NULL;
 	}
 
-	omrthread_monitor_enter(vm->blockedVirtualThreadsMutex);
 	vmFuncs->internalEnterVMFromJNI(currentThread);
+	omrthread_monitor_enter(vm->blockedVirtualThreadsMutex);
 	while (NULL == unblockedList) {
 		if (NULL != vm->blockedContinuations) {
 restart:
-			J9VMContinuation *listHead = vm->blockedContinuations;
+			J9VMContinuation *previous = NULL;
+			J9VMContinuation *current = vm->blockedContinuations;
 			J9VMContinuation *next = NULL;
-			vm->blockedContinuations = NULL;
-			while (NULL != listHead) {
+			bool hasPlatformThreadWaiting = false;
+			while (NULL != current) {
 				bool unblocked = false;
-				next = listHead->nextWaitingContinuation;
-				if (J9VMJAVALANGVIRTUALTHREAD_ONWAITINGLIST(currentThread, listHead->vthread)) {
-					unblocked = true;
-				} else {
-					j9object_t continuationObj = J9VMJAVALANGVIRTUALTHREAD_CONT(currentThread, listHead->vthread);
-					j9object_t syncObject = J9VMJDKINTERNALVMCONTINUATION_BLOCKER(currentThread, continuationObj);
-					J9ObjectMonitor *syncObjectMonitor = NULL;
-					j9objectmonitor_t lock = 0;
-					if (!LN_HAS_LOCKWORD(currentThread, syncObject)) {
-						syncObjectMonitor = vmFuncs->monitorTablePeek(vm, syncObject);
-						if (NULL != syncObjectMonitor){
-							lock = J9_LOAD_LOCKWORD_VM(vm, &syncObjectMonitor->alternateLockword);
-						}
-					} else {
-						lock = J9OBJECT_MONITOR(currentThread, syncObject);
-					}
-					J9ThreadAbstractMonitor *monitor = getInflatedObjectMonitor(vm, syncObject, lock);
-					if (0 == monitor->count) {
-						unblocked = true;
-						if (syncObjectMonitor->virtualThreadWaitCount >= 1) {
-							syncObjectMonitor->virtualThreadWaitCount -= 1;
-						}
-						J9VMJAVALANGVIRTUALTHREAD_SET_ONWAITINGLIST(currentThread, listHead->vthread, JNI_TRUE);
-					}
+				J9ObjectMonitor *syncObjectMonitor = current->objectWaitMonitor;
+				U_32 state = J9VMJAVALANGVIRTUALTHREAD_STATE(currentThread, current->vthread);
+				next = current->nextWaitingContinuation;
+
+				/* Check if the blocking monitor has platform thread waiting,
+				 * which doesn't notify the unblocker when exiting monitor.
+				 */
+				if (((JAVA_LANG_VIRTUALTHREAD_BLOCKING == state)
+					|| (JAVA_LANG_VIRTUALTHREAD_BLOCKED == state)
+					|| (JAVA_LANG_VIRTUALTHREAD_WAIT == state)
+					|| (JAVA_LANG_VIRTUALTHREAD_TIMED_WAIT == state))
+				&& (syncObjectMonitor->platformThreadWaitCount > 0)
+				) {
+					hasPlatformThreadWaiting = true;
 				}
 
-				if (unblocked) {
-					J9VMJAVALANGVIRTUALTHREAD_SET_NEXT(currentThread, listHead->vthread, unblockedList);
-					unblockedList = listHead->vthread;
-				} else {
-					listHead->nextWaitingContinuation = vm->blockedContinuations;
-					vm->blockedContinuations = listHead;
+				/* Skip vthreads that are still in transition. */
+				switch (state) {
+				case JAVA_LANG_VIRTUALTHREAD_BLOCKING:
+				case JAVA_LANG_VIRTUALTHREAD_WAITING:
+				case JAVA_LANG_VIRTUALTHREAD_TIMED_WAITING:
+					J9VMJAVALANGVIRTUALTHREAD_SET_BLOCKPERMIT(currentThread, current->vthread, JNI_TRUE);
+					previous = current;
+					current = next;
+					continue;
+				case JAVA_LANG_VIRTUALTHREAD_WAIT:
+				case JAVA_LANG_VIRTUALTHREAD_TIMED_WAIT:
+					/* WAIT/TIMED_WAIT can only be added to blocked list if they have been notified. */
+					Assert_VM_true(J9VMJAVALANGVIRTUALTHREAD_NOTIFIED(currentThread, current->vthread));
+					break;
+				case JAVA_LANG_VIRTUALTHREAD_BLOCKED:
+				{
+					Assert_VM_true(syncObjectMonitor->virtualThreadWaitCount > 0);
+					omrthread_monitor_t monitor = syncObjectMonitor->monitor;
+					/* All blocking/waiting monitor have to be inflated, if the monitor has not been inflated,
+					 * then the owner have not yet released the flatlock.
+					 */
+					if (J9_ARE_ANY_BITS_SET(((J9ThreadMonitor *)monitor)->flags, J9THREAD_MONITOR_INFLATED)) {
+						if (0 == monitor->count) {
+							unblocked = true;
+							syncObjectMonitor->virtualThreadWaitCount -= 1;
+							J9VMJAVALANGVIRTUALTHREAD_SET_ONWAITINGLIST(currentThread, current->vthread, JNI_TRUE);
+						}
+					}
+					break;
 				}
-				listHead = next;
+				default:
+				{
+					if (J9_ARE_ANY_BITS_SET(state, JAVA_LANG_VIRTUALTHREAD_SUSPENDED)) {
+						J9VMJAVALANGVIRTUALTHREAD_SET_BLOCKPERMIT(currentThread, current->vthread, JNI_TRUE);
+					} else {
+						/* Thread must be unblocked by AfterYield(), hence it can only be UNBLOCKED or RUNNING. */
+						Assert_VM_true((JAVA_LANG_VIRTUALTHREAD_RUNNING == state) || (JAVA_LANG_VIRTUALTHREAD_UNBLOCKED == state));
+					}
+					break;
+				}
+				} /* switch (state) */
+
+				if (unblocked) {
+					/* Add to Java unblock list. */
+					J9VMJAVALANGVIRTUALTHREAD_SET_NEXT(currentThread, current->vthread, unblockedList);
+					unblockedList = current->vthread;
+
+					/* Remove from native blocking list. */
+					current->nextWaitingContinuation = NULL;
+
+					if (NULL == previous) {
+						vm->blockedContinuations = next;
+					} else {
+						previous->nextWaitingContinuation = next;
+					}
+				} else {
+					/* Keep in native blocking list. */
+					previous = current;
+				}
+
+				current = next;
 			}
-			if (NULL == unblockedList) {
-				vmFuncs->internalExitVMToJNI(currentThread);
-				omrthread_monitor_wait(vm->blockedVirtualThreadsMutex);
-				vmFuncs->internalEnterVMFromJNI(currentThread);
+			if ((NULL == unblockedList) && !hasPlatformThreadWaiting) {
+
+				waitForSignal(currentThread);
 				goto restart;
 			} else {
 				result = vmFuncs->j9jni_createLocalRef((JNIEnv *)currentThread, unblockedList);
 				break;
 			}
+		} else {
+			waitForSignal(currentThread);
 		}
 	}
-	vmFuncs->internalExitVMToJNI(currentThread);
 	omrthread_monitor_exit(vm->blockedVirtualThreadsMutex);
+	vmFuncs->internalExitVMToJNI(currentThread);
 
 	return result;
 }

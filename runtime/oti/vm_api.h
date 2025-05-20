@@ -287,6 +287,9 @@ resolveNativeAddress(J9VMThread *currentThread, J9Method *nativeMethod, UDATA ru
 
 /**
 * @brief
+*
+* This method has potential GC point.
+*
 * @param *javaVM
 * @param *classLoaderObject
 * @return J9ClassLoader
@@ -378,6 +381,8 @@ internalCreateArrayClassWithOptions(J9VMThread *vmThread, J9ROMArrayClass *romCl
 /**
  * Load the class with the specified name in a given module
  *
+ * This method has potential GC point.
+ *
  * @param currentThread Current VM thread
  * @param moduleName j.l.String object representing module name; can be null
  * @param className String object representing name of the class to load
@@ -395,6 +400,8 @@ internalFindClassString(J9VMThread* currentThread, j9object_t moduleName, j9obje
 /**
  * Load the class with the specified name in the given module.
  *
+ * This method has potential GC point.
+ *
  * @param currentThread Current VM thread
  * @param moduleName Pointer to J9Module representing the module containing the class
  * @param className Name of class to load
@@ -408,6 +415,35 @@ internalFindClassString(J9VMThread* currentThread, j9object_t moduleName, j9obje
 J9Class*
 internalFindClassInModule(J9VMThread* vmThread, J9Module* j9module, U_8* className, UDATA classNameLength, J9ClassLoader* classLoader, UDATA options);
 
+/**
+ * It is a wrapper method of internalFindClassInModule().
+ *
+ * This method has potential GC point.
+ *
+ * @param vmThread Current VM thread
+ * @param className Name of class to load
+ * @param classNameLength Length of the class name
+ * @param classLoader J9ClassLoader to use
+ * @param options load options such as J9_FINDCLASS_FLAG_EXISTING_ONLY
+ *
+ * @return pointer to J9Class if success, NULL if fail
+ */
+J9Class*
+internalFindClassUTF8(J9VMThread* vmThread, U_8* className, UDATA classNameLength, J9ClassLoader* classLoader, UDATA options);
+
+/**
+ * Get the class for the index, loading and initializing the class if necessary.
+ *
+ * This method has potential GC point.
+ *
+ * @param vmThread Current VM thread
+ * @param index The class index
+ * @param flags The J9_FINDKNOWNCLASS_FLAG
+ *
+ * @return pointer to J9Class if success, NULL if fail
+ */
+J9Class*
+internalFindKnownClass(J9VMThread *vmThread, UDATA index, UDATA flags);
 
 /**
 * @brief
@@ -533,6 +569,16 @@ isCRaCorCRIUSupportEnabled(J9JavaVM *vm);
  */
 BOOLEAN
 isCRIUSupportEnabled(J9VMThread *currentThread);
+
+/**
+ * @brief Queries if the time compensation is enabled.
+ * By default the time compensation is enabled, it can be disabled with -XX:-EnableTimeCompensation.
+ *
+ * @param currentThread vmthread token
+ * @return TRUE if enabled, FALSE otherwise
+ */
+BOOLEAN
+isTimeCompensationEnabled(J9VMThread *currentThread);
 
 /**
  * @brief Checks if the CRIU security provider is enabled when CRIU
@@ -4335,6 +4381,14 @@ setSystemPropertyValue(J9JavaVM * vm, J9VMSystemProperty * property, char * newV
  */
 UDATA
 addSystemProperty(J9JavaVM * vm, const char* propName,  const char* propValue, UDATA flags);
+
+/**
+ * @brief Get the default system properties.
+ *
+ * @return an Object array of system property key value pairs
+ */
+jobjectArray getSystemPropertyList(JNIEnv *env);
+
 /* ---------------- vmruntimestate.c ---------------- */
 
 /**
@@ -4688,6 +4742,24 @@ acquireVThreadInspector(J9VMThread *currentThread, jobject thread, BOOLEAN spin)
  */
 void
 releaseVThreadInspector(J9VMThread *currentThread, jobject thread);
+
+/**
+ * @brief Enter VirtualThread's critical section for transitions.
+ *
+ * @param currentThread the current thread
+ * @param thread target VirtualThread that is transitioning
+ */
+void
+enterVThreadTransitionCritical(J9VMThread *currentThread, jobject thread);
+
+/**
+ * @brief Exit VirtualThread's critical section for transitions.
+ *
+ * @param currentThread the current thread
+ * @param thread target VirtualThread that is transitioning
+ */
+void
+exitVThreadTransitionCritical(J9VMThread *currentThread, jobject thread);
 #endif /* JAVA_SPEC_VERSION >= 19 */
 
 #if JAVA_SPEC_VERSION >= 24
@@ -4696,9 +4768,10 @@ releaseVThreadInspector(J9VMThread *currentThread, jobject thread);
  *
  * @param currentThread the current thread
  * @param continuationObject the Continuation object
+ * @param isObjectWait if the call is from Object.wait()
  */
 void
-preparePinnedVirtualThreadForMount(J9VMThread *currentThread, j9object_t continuationObject);
+preparePinnedVirtualThreadForMount(J9VMThread *currentThread, j9object_t continuationObject, BOOLEAN isObjectWait);
 
 /**
  * @brief Inflate all monitors and prepare the VirtualThread to yield.
@@ -4707,7 +4780,8 @@ preparePinnedVirtualThreadForMount(J9VMThread *currentThread, j9object_t continu
  * @param syncObj object to block/wait on
  * @param isObjectWait if the call is from Object.wait()
  *
- * @return J9_OBJECT_MONITOR_YIELD_VIRTUAL if the can be successfully yielded;
+ * @return syncObj if isObjectWait is false and monitor can be acquired;
+ * J9_OBJECT_MONITOR_YIELD_VIRTUAL if the virtual thread can be successfully yielded;
  * otherwise, an error code is returned
  */
 UDATA
@@ -4723,6 +4797,17 @@ preparePinnedVirtualThreadForUnmount(J9VMThread *currentThread, j9object_t syncO
  */
 jobject
 takeVirtualThreadListToUnblock(J9VMThread *currentThread);
+
+/**
+ * @brief Inflate and detach the monitor for current vthread.
+ *
+ * @param currentThread the current thread
+ * @param lockObject the object with monitor to detach
+ *
+ * @return the inflated J9ObjectMonitor pointer
+ */
+J9ObjectMonitor *
+detachMonitorInfo(J9VMThread *currentThread, j9object_t lockObject);
 #endif /* JAVA_SPEC_VERSION >= 24 */
 /* ---------------- hookableAsync.c ---------------- */
 

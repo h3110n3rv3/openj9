@@ -30,6 +30,9 @@
 #if defined(J9VM_OPT_CRIU_SUPPORT)
 #include "CRIUHelpers.hpp"
 #endif /* defined(J9VM_OPT_CRIU_SUPPORT) */
+#if JAVA_SPEC_VERSION >= 24
+#include "ContinuationHelpers.hpp"
+#endif /* JAVA_SPEC_VERSION >= 24 */
 
 extern "C" {
 
@@ -57,6 +60,28 @@ Fast_java_lang_Object_notifyAll(J9VMThread *currentThread, j9object_t receiverOb
 		omrthread_monitor_t monitorPtr = NULL;
 
 		if (VM_ObjectMonitor::getMonitorForNotify(currentThread, receiverObject, &monitorPtr, true)) {
+#if JAVA_SPEC_VERSION >= 24
+			J9JavaVM *vm = currentThread->javaVM;
+			if (J9_ARE_ANY_BITS_SET(vm->extendedRuntimeFlags3, J9_EXTENDED_RUNTIME3_YIELD_PINNED_CONTINUATION)) {
+				j9objectmonitor_t lock = 0;
+				j9objectmonitor_t *lockEA = NULL;
+				J9ObjectMonitor *objectMonitor = NULL;
+
+				if (!LN_HAS_LOCKWORD(currentThread, receiverObject)) {
+					objectMonitor = monitorTablePeek(vm, receiverObject);
+				} else {
+					lockEA = J9OBJECT_MONITOR_EA(currentThread, receiverObject);
+					lock = J9_LOAD_LOCKWORD(currentThread, lockEA);
+					if (J9_LOCK_IS_INFLATED(lock)) {
+						objectMonitor = J9_INFLLOCK_OBJECT_MONITOR(lock);
+					}
+				}
+
+				if ((NULL != objectMonitor) && (NULL != objectMonitor->waitingContinuations)) {
+					VM_ContinuationHelpers::notifyVirtualThread(currentThread, objectMonitor, true);
+				}
+			}
+#endif /* JAVA_SPEC_VERSION >= 24 */
 			if (0 != omrthread_monitor_notify_all(monitorPtr)) {
 				setCurrentException(currentThread, J9VMCONSTANTPOOL_JAVALANGILLEGALMONITORSTATEEXCEPTION, NULL);
 			}
@@ -80,6 +105,33 @@ Fast_java_lang_Object_notify(J9VMThread *currentThread, j9object_t receiverObjec
 		omrthread_monitor_t monitorPtr = NULL;
 
 		if (VM_ObjectMonitor::getMonitorForNotify(currentThread, receiverObject, &monitorPtr, true)) {
+#if JAVA_SPEC_VERSION >= 24
+			J9JavaVM *vm = currentThread->javaVM;
+			if (J9_ARE_ANY_BITS_SET(vm->extendedRuntimeFlags3, J9_EXTENDED_RUNTIME3_YIELD_PINNED_CONTINUATION)) {
+				j9objectmonitor_t lock = 0;
+				j9objectmonitor_t *lockEA = NULL;
+				J9ObjectMonitor *objectMonitor = NULL;
+
+				if (!LN_HAS_LOCKWORD(currentThread, receiverObject)) {
+					objectMonitor = monitorTablePeek(vm, receiverObject);
+				} else {
+					lockEA = J9OBJECT_MONITOR_EA(currentThread, receiverObject);
+					lock = J9_LOAD_LOCKWORD(currentThread, lockEA);
+					if (J9_LOCK_IS_INFLATED(lock)) {
+						objectMonitor = J9_INFLLOCK_OBJECT_MONITOR(lock);
+					}
+				}
+
+				if ((NULL != objectMonitor) && (NULL != objectMonitor->waitingContinuations)) {
+					if (VM_ContinuationHelpers::notifyVirtualThread(currentThread, objectMonitor, false)) {
+						/* If a virtual thread has been successfully notified, return directly without
+						 * triggering the native notify API.
+						 */
+						return;
+					}
+				}
+			}
+#endif /* JAVA_SPEC_VERSION >= 24 */
 			if (0 != omrthread_monitor_notify(monitorPtr)) {
 				setCurrentException(currentThread, J9VMCONSTANTPOOL_JAVALANGILLEGALMONITORSTATEEXCEPTION, NULL);
 			}

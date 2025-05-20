@@ -292,6 +292,30 @@ J9::Z::TreeEvaluator::inlineStringLatin1Inflate(TR::Node *node, TR::CodeGenerato
    TR::Register *charArrayReferenceRegister = cg->gprClobberEvaluate(charArrayReferenceNode);
    TR::Register *dstOffRegister = cg->gprClobberEvaluate(dstOffNode);
 
+   // Offset to be added to array object pointer to get to the data elements
+   int32_t offsetToDataElements = TR::Compiler->om.contiguousArrayHeaderSizeInBytes();
+#ifdef J9VM_GC_SPARSE_HEAP_ALLOCATION
+   if (TR::Compiler->om.isOffHeapAllocationEnabled())
+      {
+      // Load first data element address for source array
+      generateRXInstruction(cg,
+         TR::InstOpCode::getLoadOpCode(),
+         node,
+         sourceArrayReferenceRegister,
+         generateS390MemoryReference(sourceArrayReferenceRegister, cg->comp()->fej9()->getOffsetOfContiguousDataAddrField(), cg));
+
+      // Load first data element address for char array
+      generateRXInstruction(cg,
+         TR::InstOpCode::getLoadOpCode(),
+         node,
+         charArrayReferenceRegister,
+         generateS390MemoryReference(charArrayReferenceRegister, cg->comp()->fej9()->getOffsetOfContiguousDataAddrField(), cg));
+
+      // We'll be loading first data element address from array header so no need for offset
+      offsetToDataElements = 0;
+      }
+#endif /* J9VM_GC_SPARSE_HEAP_ALLOCATION */
+
    // Adjust the array reference (source and destination) with offset in advance
    if (srcOffNode->getOpCodeValue() == TR::iconst)
       {
@@ -326,8 +350,8 @@ J9::Z::TreeEvaluator::inlineStringLatin1Inflate(TR::Node *node, TR::CodeGenerato
    // charArrayReference is the destination array. Since the vector loop below processes 16 bytes into 16 chars per iteration, we will store 32 bytes per iteration.
    // We use the `VST` instruction twice to store 16 bytes at a time. Hence, we need a "low" and "high" memref for the char array in order to store all 32 bytes per iteration
    // of the vector loop.
-   TR::MemoryReference *charArrayReferenceMemRefLow = generateS390MemoryReference(charArrayReferenceRegister, TR::Compiler->om.contiguousArrayHeaderSizeInBytes(), cg);
-   TR::MemoryReference *charArrayReferenceMemRefHigh = generateS390MemoryReference(charArrayReferenceRegister, TR::Compiler->om.contiguousArrayHeaderSizeInBytes() + 16, cg);
+   TR::MemoryReference *charArrayReferenceMemRefLow = generateS390MemoryReference(charArrayReferenceRegister, offsetToDataElements, cg);
+   TR::MemoryReference *charArrayReferenceMemRefHigh = generateS390MemoryReference(charArrayReferenceRegister, offsetToDataElements + 16, cg);
 
    // numCharsMinusResidue is used as a scratch register to hold temporary values throughout the algorithm.
    TR::Register *numCharsMinusResidue = cg->allocateRegister();
@@ -354,7 +378,7 @@ J9::Z::TreeEvaluator::inlineStringLatin1Inflate(TR::Node *node, TR::CodeGenerato
    // We keep executing the vector tight loop below until only the residual characters remain to process.
    generateS390CompareAndBranchInstruction(cg, TR::InstOpCode::CR, node, srcOffRegister, numCharsMinusResidue, TR::InstOpCode::COND_BH, handleResidueLabel, false, false);
    TR::Register* registerV1 = cg->allocateRegister(TR_VRF);
-   TR::MemoryReference *sourceArrayMemRef = generateS390MemoryReference(sourceArrayReferenceRegister, TR::Compiler->om.contiguousArrayHeaderSizeInBytes(), cg);
+   TR::MemoryReference *sourceArrayMemRef = generateS390MemoryReference(sourceArrayReferenceRegister, offsetToDataElements, cg);
    // Do a vector load to batch process the characters.
    generateVRXInstruction(cg, TR::InstOpCode::VL, node, registerV1, sourceArrayMemRef);
    TR::Register* registerV2 = cg->allocateRegister(TR_VRF);
@@ -375,9 +399,9 @@ J9::Z::TreeEvaluator::inlineStringLatin1Inflate(TR::Node *node, TR::CodeGenerato
    // Once we reach this label, only the residual characters need to be processed.
    generateS390LabelInstruction(cg, TR::InstOpCode::label, node, handleResidueLabel);
 
-   TR::MemoryReference *sourceArrayMemRef2 = generateS390MemoryReference(sourceArrayReferenceRegister2, TR::Compiler->om.contiguousArrayHeaderSizeInBytes(), cg);
-   TR::MemoryReference *charArrayReferenceMemRefLow2 = generateS390MemoryReference(charArrayReferenceRegister, TR::Compiler->om.contiguousArrayHeaderSizeInBytes(), cg);
-   TR::MemoryReference *charArrayReferenceMemRefHigh2 = generateS390MemoryReference(charArrayReferenceRegister, TR::Compiler->om.contiguousArrayHeaderSizeInBytes() + 16, cg);
+   TR::MemoryReference *sourceArrayMemRef2 = generateS390MemoryReference(sourceArrayReferenceRegister2, offsetToDataElements, cg);
+   TR::MemoryReference *charArrayReferenceMemRefLow2 = generateS390MemoryReference(charArrayReferenceRegister, offsetToDataElements, cg);
+   TR::MemoryReference *charArrayReferenceMemRefHigh2 = generateS390MemoryReference(charArrayReferenceRegister, offsetToDataElements + 16, cg);
 
    TR::Register *quoRegister = cg->allocateRegister();
    // Do lenRegister / 16 to calculate remaining number of chars using the Divide Logical (DLR) instruction.
@@ -443,26 +467,26 @@ J9::Z::TreeEvaluator::inlineStringLatin1Inflate(TR::Node *node, TR::CodeGenerato
    ((TR::S390RegInstruction *)cursor)->setBranchCondition(TR::InstOpCode::COND_BCR);
 
    // 7 chars left
-   generateRXInstruction(cg, TR::InstOpCode::LLC, node, tempReg, generateS390MemoryReference(sourceArrayReferenceRegister, TR::Compiler->om.contiguousArrayHeaderSizeInBytes() + 6, cg));
-   generateRXInstruction(cg, TR::InstOpCode::STH, node, tempReg, generateS390MemoryReference(charArrayReferenceRegister, TR::Compiler->om.contiguousArrayHeaderSizeInBytes() + 12, cg));
+   generateRXInstruction(cg, TR::InstOpCode::LLC, node, tempReg, generateS390MemoryReference(sourceArrayReferenceRegister, offsetToDataElements + 6, cg));
+   generateRXInstruction(cg, TR::InstOpCode::STH, node, tempReg, generateS390MemoryReference(charArrayReferenceRegister, offsetToDataElements + 12, cg));
    // 6 chars left
-   generateRXInstruction(cg, TR::InstOpCode::LLC, node, tempReg, generateS390MemoryReference(sourceArrayReferenceRegister, TR::Compiler->om.contiguousArrayHeaderSizeInBytes() + 5, cg));
-   generateRXInstruction(cg, TR::InstOpCode::STH, node, tempReg, generateS390MemoryReference(charArrayReferenceRegister, TR::Compiler->om.contiguousArrayHeaderSizeInBytes() + 10, cg));
+   generateRXInstruction(cg, TR::InstOpCode::LLC, node, tempReg, generateS390MemoryReference(sourceArrayReferenceRegister, offsetToDataElements + 5, cg));
+   generateRXInstruction(cg, TR::InstOpCode::STH, node, tempReg, generateS390MemoryReference(charArrayReferenceRegister, offsetToDataElements + 10, cg));
    // 5 chars left
-   generateRXInstruction(cg, TR::InstOpCode::LLC, node, tempReg, generateS390MemoryReference(sourceArrayReferenceRegister, TR::Compiler->om.contiguousArrayHeaderSizeInBytes() + 4, cg));
-   generateRXInstruction(cg, TR::InstOpCode::STH, node, tempReg, generateS390MemoryReference(charArrayReferenceRegister, TR::Compiler->om.contiguousArrayHeaderSizeInBytes() + 8, cg));
+   generateRXInstruction(cg, TR::InstOpCode::LLC, node, tempReg, generateS390MemoryReference(sourceArrayReferenceRegister, offsetToDataElements + 4, cg));
+   generateRXInstruction(cg, TR::InstOpCode::STH, node, tempReg, generateS390MemoryReference(charArrayReferenceRegister, offsetToDataElements + 8, cg));
    // 4 chars left
-   generateRXInstruction(cg, TR::InstOpCode::LLC, node, tempReg, generateS390MemoryReference(sourceArrayReferenceRegister, TR::Compiler->om.contiguousArrayHeaderSizeInBytes() + 3, cg));
-   generateRXInstruction(cg, TR::InstOpCode::STH, node, tempReg, generateS390MemoryReference(charArrayReferenceRegister, TR::Compiler->om.contiguousArrayHeaderSizeInBytes() + 6, cg));
+   generateRXInstruction(cg, TR::InstOpCode::LLC, node, tempReg, generateS390MemoryReference(sourceArrayReferenceRegister, offsetToDataElements + 3, cg));
+   generateRXInstruction(cg, TR::InstOpCode::STH, node, tempReg, generateS390MemoryReference(charArrayReferenceRegister, offsetToDataElements + 6, cg));
    // 3 chars left
-   generateRXInstruction(cg, TR::InstOpCode::LLC, node, tempReg, generateS390MemoryReference(sourceArrayReferenceRegister, TR::Compiler->om.contiguousArrayHeaderSizeInBytes() + 2, cg));
-   generateRXInstruction(cg, TR::InstOpCode::STH, node, tempReg, generateS390MemoryReference(charArrayReferenceRegister, TR::Compiler->om.contiguousArrayHeaderSizeInBytes() + 4, cg));
+   generateRXInstruction(cg, TR::InstOpCode::LLC, node, tempReg, generateS390MemoryReference(sourceArrayReferenceRegister, offsetToDataElements + 2, cg));
+   generateRXInstruction(cg, TR::InstOpCode::STH, node, tempReg, generateS390MemoryReference(charArrayReferenceRegister, offsetToDataElements + 4, cg));
    // 2 chars left
-   generateRXInstruction(cg, TR::InstOpCode::LLC, node, tempReg, generateS390MemoryReference(sourceArrayReferenceRegister, TR::Compiler->om.contiguousArrayHeaderSizeInBytes() + 1, cg));
-   generateRXInstruction(cg, TR::InstOpCode::STH, node, tempReg, generateS390MemoryReference(charArrayReferenceRegister, TR::Compiler->om.contiguousArrayHeaderSizeInBytes() + 2, cg));
+   generateRXInstruction(cg, TR::InstOpCode::LLC, node, tempReg, generateS390MemoryReference(sourceArrayReferenceRegister, offsetToDataElements + 1, cg));
+   generateRXInstruction(cg, TR::InstOpCode::STH, node, tempReg, generateS390MemoryReference(charArrayReferenceRegister, offsetToDataElements + 2, cg));
    // 1 chars left
-   generateRXInstruction(cg, TR::InstOpCode::LLC, node, tempReg, generateS390MemoryReference(sourceArrayReferenceRegister, TR::Compiler->om.contiguousArrayHeaderSizeInBytes() + 0, cg));
-   generateRXInstruction(cg, TR::InstOpCode::STH, node, tempReg, generateS390MemoryReference(charArrayReferenceRegister, TR::Compiler->om.contiguousArrayHeaderSizeInBytes() + 0, cg));
+   generateRXInstruction(cg, TR::InstOpCode::LLC, node, tempReg, generateS390MemoryReference(sourceArrayReferenceRegister, offsetToDataElements + 0, cg));
+   generateRXInstruction(cg, TR::InstOpCode::STH, node, tempReg, generateS390MemoryReference(charArrayReferenceRegister, offsetToDataElements + 0, cg));
 
    TR::RegisterDependencyConditions* dependencies = new (cg->trHeapMemory()) TR::RegisterDependencyConditions(0, 14, cg);
    dependencies->addPostConditionIfNotAlreadyInserted(sourceArrayReferenceRegister, TR::RealRegister::AssignAny);
@@ -917,6 +941,27 @@ J9::Z::TreeEvaluator::inlineStringCodingHasNegativesOrCountPositives(TR::Node *n
       generateRIInstruction(cg, TR::InstOpCode::LGHI, node, returnReg, 0);
       }
 
+#ifdef J9VM_GC_SPARSE_HEAP_ALLOCATION
+   if (TR::Compiler->om.isOffHeapAllocationEnabled())
+      {
+      // Load first data element address for input array
+      generateRXInstruction(cg,
+         TR::InstOpCode::getLoadOpCode(),
+         node,
+         inputPtrReg,
+         generateS390MemoryReference(inputPtrReg, cg->comp()->fej9()->getOffsetOfContiguousDataAddrField(), cg));
+      }
+   else
+#endif /* J9VM_GC_SPARSE_HEAP_ALLOCATION */
+      {
+      // Add array header size to get address of first data element
+      generateRXInstruction(cg,
+         TR::InstOpCode::getLoadAddressOpCode(),
+         node,
+         inputPtrReg,
+         generateS390MemoryReference(inputPtrReg, TR::Compiler->om.contiguousArrayHeaderSizeInBytes(), cg));
+      }
+
    generateS390LabelInstruction(cg, TR::InstOpCode::label, node, cFlowRegionStart);
    cFlowRegionStart->setStartInternalControlFlow();
    generateS390CompareAndBranchInstruction(cg, TR::InstOpCode::C, node, lengthReg, 0, TR::InstOpCode::COND_BE, cFlowRegionEnd, false, false);
@@ -934,7 +979,7 @@ J9::Z::TreeEvaluator::inlineStringCodingHasNegativesOrCountPositives(TR::Node *n
    generateS390LabelInstruction(cg, TR::InstOpCode::label, node, processMultiple16CharsStart);
 
    // Load bytes and search for out of range character
-   generateVRXInstruction(cg, TR::InstOpCode::VL, node, vInput, generateS390MemoryReference(inputPtrReg, TR::Compiler->om.contiguousArrayHeaderSizeInBytes(), cg));
+   generateVRXInstruction(cg, TR::InstOpCode::VL, node, vInput, generateS390MemoryReference(inputPtrReg, 0, cg));
 
    generateVRRdInstruction(cg, TR::InstOpCode::VSTRC, node, outOfRangeCharIndex, vInput, vUpperLimit, vComparison, 0x1, 0);
 
@@ -956,7 +1001,7 @@ J9::Z::TreeEvaluator::inlineStringCodingHasNegativesOrCountPositives(TR::Node *n
    // VLL and VSTL work on indices so we subtract 1
    generateRIInstruction(cg, TR::InstOpCode::AHI, node, numCharsLeftToProcess, -1);
    // Load residue bytes and check for out of range character
-   generateVRSbInstruction(cg, TR::InstOpCode::VLL, node, vInput, numCharsLeftToProcess, generateS390MemoryReference(inputPtrReg, TR::Compiler->om.contiguousArrayHeaderSizeInBytes(), cg));
+   generateVRSbInstruction(cg, TR::InstOpCode::VLL, node, vInput, numCharsLeftToProcess, generateS390MemoryReference(inputPtrReg, 0, cg));
 
    generateVRRdInstruction(cg, TR::InstOpCode::VSTRC, node, outOfRangeCharIndex, vInput, vUpperLimit, vComparison, 0x1, 0);
    generateS390BranchInstruction(cg, TR::InstOpCode::BRC, TR::InstOpCode::COND_CC1, node, isCountPositives ? processCountPositivesOutOfRangeChar : processOutOfRangeChar);
@@ -1097,7 +1142,7 @@ J9::Z::TreeEvaluator::inlineVectorizedStringIndexOf(TR::Node* node, TR::CodeGene
    TR::Compilation *comp = cg->comp();
    const uint32_t elementSizeMask = isUTF16 ? 1 : 0;
    const int8_t vectorSize = cg->machine()->getVRFSize();
-   const uintptr_t headerSize = TR::Compiler->om.contiguousArrayHeaderSizeInBytes();
+
    const bool supportsVSTRS = comp->target().cpu.supportsFeature(OMR_FEATURE_S390_VECTOR_FACILITY_ENHANCEMENT_2);
    TR_Debug *compDebug = comp->getDebug();
    TR::Instruction* cursor;
@@ -1117,11 +1162,44 @@ J9::Z::TreeEvaluator::inlineVectorizedStringIndexOf(TR::Node* node, TR::CodeGene
    TR_S390ScratchRegisterManager *srm = cg->generateScratchRegisterManager(9);
 
    // Get call parameters where stringValue and patternValue are byte arrays
-   TR::Register* stringValueReg = cg->evaluate(node->getChild(firstCallArgIdx));
+   TR::Register* stringValueReg = NULL;
    TR::Register* stringLenReg = cg->gprClobberEvaluate(node->getChild(firstCallArgIdx+1));
-   TR::Register* patternValueReg = cg->evaluate(node->getChild(firstCallArgIdx+2));
+   TR::Register* patternValueReg = NULL;
    TR::Register* patternLenReg = cg->gprClobberEvaluate(node->getChild(firstCallArgIdx+3));
    TR::Register* stringIndexReg = cg->gprClobberEvaluate(node->getChild(firstCallArgIdx+4));
+
+   // Offset to be added to array object pointer to get to the data elements
+   int32_t offsetToDataElements = static_cast<int32_t>(TR::Compiler->om.contiguousArrayHeaderSizeInBytes());
+#ifdef J9VM_GC_SPARSE_HEAP_ALLOCATION
+   if (TR::Compiler->om.isOffHeapAllocationEnabled())
+      {
+      // Clobber evaluate string and pattern value nodes as we'll overwrite those with first data element address
+      stringValueReg = cg->gprClobberEvaluate(node->getChild(firstCallArgIdx));
+      patternValueReg = cg->gprClobberEvaluate(node->getChild(firstCallArgIdx+2));
+
+      // Load first data element address for string
+      generateRXInstruction(cg,
+         TR::InstOpCode::getLoadOpCode(),
+         node,
+         stringValueReg,
+         generateS390MemoryReference(stringValueReg, cg->comp()->fej9()->getOffsetOfContiguousDataAddrField(), cg));
+
+      // Load first data element address pattern
+      generateRXInstruction(cg,
+         TR::InstOpCode::getLoadOpCode(),
+         node,
+         patternValueReg,
+         generateS390MemoryReference(patternValueReg, cg->comp()->fej9()->getOffsetOfContiguousDataAddrField(), cg));
+
+      // Since the first data element address is retrieved from the array header, the offset is set to 0
+      offsetToDataElements = 0;
+      }
+   else
+#endif /* J9VM_GC_SPARSE_HEAP_ALLOCATION */
+      {
+      stringValueReg = cg->evaluate(node->getChild(firstCallArgIdx));
+      patternValueReg = cg->evaluate(node->getChild(firstCallArgIdx+2));
+      }
 
    // Registers
    TR::Register* matchIndexReg    = cg->allocateRegister();
@@ -1236,14 +1314,14 @@ J9::Z::TreeEvaluator::inlineVectorizedStringIndexOf(TR::Node* node, TR::CodeGene
 
       generateRIEInstruction(cg, TR::InstOpCode::getCmpImmBranchRelOpCode(), node, patternLenReg, (int8_t)vectorSize, labelPatternLoad16Bytes, TR::InstOpCode::COND_BNL);
       generateRIEInstruction(cg, TR::InstOpCode::getAddHalfWordImmDistinctOperandOpCode(), node, loadLenReg, patternLenReg, -1);
-      generateVRSbInstruction(cg, TR::InstOpCode::VLL, node, patternHeadVReg, loadLenReg, generateS390MemoryReference(patternValueReg, headerSize, cg));
+      generateVRSbInstruction(cg, TR::InstOpCode::VLL, node, patternHeadVReg, loadLenReg, generateS390MemoryReference(patternValueReg, offsetToDataElements, cg));
       generateRRInstruction(cg, TR::InstOpCode::getLoadRegOpCode(), node, loadLenReg, patternLenReg);
       generateVRSbInstruction(cg, TR::InstOpCode::VLVG, node, patternLenVReg, patternLenReg, generateS390MemoryReference(7, cg), 0);
       generateS390BranchInstruction(cg, TR::InstOpCode::BRC, TR::InstOpCode::COND_BRC, node, labelPatternLoadDone);
 
       cursor = generateS390LabelInstruction(cg, TR::InstOpCode::label, node, labelPatternLoad16Bytes);
       iComment("load first 16 bytes of the pattern");
-      generateVRXInstruction(cg, TR::InstOpCode::VL, node, patternHeadVReg, generateS390MemoryReference(patternValueReg, headerSize, cg));
+      generateVRXInstruction(cg, TR::InstOpCode::VL, node, patternHeadVReg, generateS390MemoryReference(patternValueReg, offsetToDataElements, cg));
       generateRIInstruction(cg, TR::InstOpCode::LHI, node, loadLenReg, vectorSize);
       generateVRSbInstruction(cg, TR::InstOpCode::VLVG, node, patternLenVReg, loadLenReg, generateS390MemoryReference(7, cg), 0);
       cursor = generateS390LabelInstruction(cg, TR::InstOpCode::label, node, labelPatternLoadDone);
@@ -1262,13 +1340,13 @@ J9::Z::TreeEvaluator::inlineVectorizedStringIndexOf(TR::Node* node, TR::CodeGene
       // e.g. If the load length is 8 bytes, the highest index is 7. Hence, the need for -1.
       cursor = generateRIInstruction(cg, TR::InstOpCode::getAddHalfWordImmOpCode(), node, loadLenReg, -1);
       iComment("needs -1 because VLL's third operand is the highest index to load");
-      generateVRSbInstruction(cg, TR::InstOpCode::VLL, node, stringVReg, loadLenReg, generateS390MemoryReference(stringCharPtrReg, headerSize, cg));
+      generateVRSbInstruction(cg, TR::InstOpCode::VLL, node, stringVReg, loadLenReg, generateS390MemoryReference(stringCharPtrReg, offsetToDataElements, cg));
       generateRIInstruction(cg, TR::InstOpCode::getAddHalfWordImmOpCode(), node, loadLenReg, 1);
       generateS390BranchInstruction(cg, TR::InstOpCode::BRC, TR::InstOpCode::COND_BRC, node, labelLoadStringLenDone);
       srm->reclaimScratchRegister(stringCharPtrReg);
       cursor = generateS390LabelInstruction(cg, TR::InstOpCode::label, node, labelLoadString16Bytes);
       iComment("load 16 bytes of the string");
-      generateVRXInstruction(cg, TR::InstOpCode::VL, node, stringVReg, generateS390MemoryReference(stringValueReg, stringIndexReg, headerSize, cg));
+      generateVRXInstruction(cg, TR::InstOpCode::VL, node, stringVReg, generateS390MemoryReference(stringValueReg, stringIndexReg, offsetToDataElements, cg));
       generateRIInstruction(cg, TR::InstOpCode::getLoadHalfWordImmOpCode(), node, loadLenReg, vectorSize);
       cursor = generateS390LabelInstruction(cg, TR::InstOpCode::label, node, labelLoadStringLenDone);
       iComment("bytes of the string have been loaded");
@@ -1347,7 +1425,7 @@ J9::Z::TreeEvaluator::inlineVectorizedStringIndexOf(TR::Node* node, TR::CodeGene
       /************************************** 1st char of pattern ******************************************/
       cursor = generateS390LabelInstruction(cg, TR::InstOpCode::label, node, labelFindPatternHead);
       iComment("find first character of pattern");
-      generateVRXInstruction(cg, TR::InstOpCode::VLREP, node, patternFirstCharVReg, generateS390MemoryReference(patternValueReg, headerSize, cg), elementSizeMask);
+      generateVRXInstruction(cg, TR::InstOpCode::VLREP, node, patternFirstCharVReg, generateS390MemoryReference(patternValueReg, offsetToDataElements, cg), elementSizeMask);
 
       // Determine string load length. loadLenReg is either vectorSize-1 (15) or the 1st_char_matching residue length.
       generateRIEInstruction(cg, TR::InstOpCode::getAddHalfWordImmDistinctOperandOpCode(), node, loadLenReg, stringIndexReg, vectorSize);
@@ -1366,7 +1444,7 @@ J9::Z::TreeEvaluator::inlineVectorizedStringIndexOf(TR::Node* node, TR::CodeGene
       TR::Register* stringCharPtrReg = srm->findOrCreateScratchRegister();
       TR::LabelSymbol* labelExtractFirstCharPos = generateLabelSymbol(cg);
       generateRRRInstruction(cg, TR::InstOpCode::getAddThreeRegOpCode(), node, stringCharPtrReg, stringValueReg, stringIndexReg);
-      generateVRSbInstruction(cg, TR::InstOpCode::VLL, node, stringVReg, loadLenReg, generateS390MemoryReference(stringCharPtrReg, headerSize, cg));
+      generateVRSbInstruction(cg, TR::InstOpCode::VLL, node, stringVReg, loadLenReg, generateS390MemoryReference(stringCharPtrReg, offsetToDataElements, cg));
       generateVRRbInstruction(cg, TR::InstOpCode::VFEE, node, searchResultVReg, stringVReg, patternFirstCharVReg, 0x1, elementSizeMask);
       generateS390BranchInstruction(cg, TR::InstOpCode::BRC, TR::InstOpCode::COND_CC1, node, labelExtractFirstCharPos);
       srm->reclaimScratchRegister(stringCharPtrReg);
@@ -1407,11 +1485,11 @@ J9::Z::TreeEvaluator::inlineVectorizedStringIndexOf(TR::Node* node, TR::CodeGene
 
    // Vector loads use load index. And [load_index = load_len - 1]
    generateRIInstruction(cg, TR::InstOpCode::getAddHalfWordImmOpCode(), node, loadLenReg, -1);
-   generateVRSbInstruction(cg, TR::InstOpCode::VLL, node, stringVReg, loadLenReg, generateS390MemoryReference(stringCharPtrReg, headerSize, cg));
+   generateVRSbInstruction(cg, TR::InstOpCode::VLL, node, stringVReg, loadLenReg, generateS390MemoryReference(stringCharPtrReg, offsetToDataElements, cg));
    srm->reclaimScratchRegister(stringCharPtrReg);
    // If VSTRS is supported, the first VSTRS already handled the 1st 16 bytes at this point (full match in the 1st 16
-   // bytes). Hence, residue offset starts at 16.
-   uint32_t patternResidueDisp = headerSize + (supportsVSTRS ? vectorSize : 0);
+   // bytes). Hence, residue offset starts at 16. This applies only to non-offheap mode, for off-heap offsetToDataElements is 0.
+   uint32_t patternResidueDisp = offsetToDataElements + (supportsVSTRS ? vectorSize : 0);
 
    generateVRSbInstruction(cg, TR::InstOpCode::VLL, node, patternVReg, loadLenReg, generateS390MemoryReference(patternValueReg, patternResidueDisp, cg));
    generateRIInstruction(cg, TR::InstOpCode::getAddHalfWordImmOpCode(), node, loadLenReg, 1);
@@ -1459,8 +1537,8 @@ J9::Z::TreeEvaluator::inlineVectorizedStringIndexOf(TR::Node* node, TR::CodeGene
    cursor = generateS390LabelInstruction(cg, TR::InstOpCode::label, node, labelMatchPatternLoop);
    iComment("start search for reset of the pattern");
    // Start to match the reset of pattern
-   generateVRXInstruction(cg, TR::InstOpCode::VL, node, stringVReg, generateS390MemoryReference(stringValueReg, stringIndexReg, headerSize, cg));
-   generateVRXInstruction(cg, TR::InstOpCode::VL, node, patternVReg, generateS390MemoryReference(patternValueReg, patternIndexReg, headerSize, cg));
+   generateVRXInstruction(cg, TR::InstOpCode::VL, node, stringVReg, generateS390MemoryReference(stringValueReg, stringIndexReg, offsetToDataElements, cg));
+   generateVRXInstruction(cg, TR::InstOpCode::VL, node, patternVReg, generateS390MemoryReference(patternValueReg, patternIndexReg, offsetToDataElements, cg));
 
    generateVRRbInstruction(cg, TR::InstOpCode::VCEQ, node, searchResultVReg, stringVReg, patternVReg, 1, elementSizeMask);
    generateS390BranchInstruction(cg, TR::InstOpCode::BRC, TR::InstOpCode::COND_CC0, node, labelPartialPatternMatch);
@@ -1543,6 +1621,10 @@ J9::Z::TreeEvaluator::inlineVectorizedStringIndexOf(TR::Node* node, TR::CodeGene
       {
       cg->decReferenceCount(node->getChild(i));
       }
+   cg->stopUsingRegister(stringValueReg);
+   cg->stopUsingRegister(stringLenReg);
+   cg->stopUsingRegister(patternValueReg);
+   cg->stopUsingRegister(patternLenReg);
    cg->stopUsingRegister(stringIndexReg);
    srm->stopUsingRegisters();
 
@@ -1797,7 +1879,31 @@ J9::Z::TreeEvaluator::inlineIntrinsicIndexOf(TR::Node * node, TR::CodeGenerator 
    // receiver. Hence, the need for static call check.
    const bool isStaticCall = node->getSymbolReference()->getSymbol()->castToMethodSymbol()->isStatic();
    const uint8_t firstCallArgIdx = isStaticCall ? 0 : 1;
-   TR::Register* array = cg->evaluate(node->getChild(firstCallArgIdx));
+   TR::Register* array = NULL;
+
+   // Offset to be added to array object pointer to get to the data elements
+   int32_t offsetToDataElements = static_cast<int32_t>(TR::Compiler->om.contiguousArrayHeaderSizeInBytes());
+#ifdef J9VM_GC_SPARSE_HEAP_ALLOCATION
+   if (TR::Compiler->om.isOffHeapAllocationEnabled())
+      {
+      // Clobber evaluate array node as we'll overwrite it with first data element address
+      array = cg->gprClobberEvaluate(node->getChild(firstCallArgIdx));
+
+      // Load first data element address
+      generateRXInstruction(cg,
+         TR::InstOpCode::getLoadOpCode(),
+         node,
+         array,
+         generateS390MemoryReference(array, cg->comp()->fej9()->getOffsetOfContiguousDataAddrField(), cg));
+
+      // Since the first data element address is retrieved from the array header, the offset is set to 0
+      offsetToDataElements = 0;
+      }
+   else
+#endif /* J9VM_GC_SPARSE_HEAP_ALLOCATION */
+      {
+      array = cg->evaluate(node->getChild(firstCallArgIdx));
+      }
    TR::Register* ch = cg->evaluate(node->getChild(firstCallArgIdx+1));
    TR::Register* offset = cg->evaluate(node->getChild(firstCallArgIdx+2));
    TR::Register* length = cg->gprClobberEvaluate(node->getChild(firstCallArgIdx+3));
@@ -1826,6 +1932,7 @@ J9::Z::TreeEvaluator::inlineIntrinsicIndexOf(TR::Node * node, TR::CodeGenerator 
    TR::LabelSymbol* cFlowRegionEnd = generateLabelSymbol( cg);
 
    TR::RegisterDependencyConditions* regDeps = new (cg->trHeapMemory()) TR::RegisterDependencyConditions(0, 8, cg);
+
    regDeps->addPostCondition(array, TR::RealRegister::AssignAny);
    regDeps->addPostCondition(loopCounter, TR::RealRegister::AssignAny);
    regDeps->addPostCondition(indexRegister, TR::RealRegister::AssignAny);
@@ -1867,8 +1974,7 @@ J9::Z::TreeEvaluator::inlineIntrinsicIndexOf(TR::Node * node, TR::CodeGenerator 
 
    // VLL takes an index, not a count, so subtract 1 from the count
    generateRILInstruction(cg, TR::InstOpCode::SLFI, node, loadLength, 1);
-
-   generateRXInstruction(cg, TR::InstOpCode::LA, node, offsetAddress, generateS390MemoryReference(array, indexRegister, TR::Compiler->om.contiguousArrayHeaderSizeInBytes(), cg));
+   generateRXInstruction(cg, TR::InstOpCode::LA, node, offsetAddress, generateS390MemoryReference(array, indexRegister, offsetToDataElements, cg));
    generateVRSbInstruction(cg, TR::InstOpCode::VLL, node, charBufferVector, loadLength, generateS390MemoryReference(offsetAddress, 0, cg));
 
    generateVRRbInstruction(cg, TR::InstOpCode::VFEE, node, resultVector, charBufferVector, valueVector, 0x1, elementSizeMask);
@@ -1896,7 +2002,7 @@ J9::Z::TreeEvaluator::inlineIntrinsicIndexOf(TR::Node * node, TR::CodeGenerator 
 
    generateS390LabelInstruction(cg, TR::InstOpCode::label, node, loopLabel);
 
-   generateVRXInstruction(cg, TR::InstOpCode::VL, node, charBufferVector, generateS390MemoryReference(array, indexRegister, TR::Compiler->om.contiguousArrayHeaderSizeInBytes(), cg));
+   generateVRXInstruction(cg, TR::InstOpCode::VL, node, charBufferVector, generateS390MemoryReference(array, indexRegister, offsetToDataElements, cg));
 
    generateVRRbInstruction(cg, TR::InstOpCode::VFEE, node, resultVector, charBufferVector, valueVector, 0x1, elementSizeMask);
    generateS390BranchInstruction(cg, TR::InstOpCode::BRC, TR::InstOpCode::COND_MASK4, node, foundLabel);
@@ -1922,6 +2028,11 @@ J9::Z::TreeEvaluator::inlineIntrinsicIndexOf(TR::Node * node, TR::CodeGenerator 
 
    generateS390LabelInstruction(cg, TR::InstOpCode::label, node, cFlowRegionEnd, regDeps);
    cFlowRegionEnd->setEndInternalControlFlow();
+
+   cg->stopUsingRegister(array);
+   cg->stopUsingRegister(ch);
+   cg->stopUsingRegister(offset);
+   cg->stopUsingRegister(length);
 
    cg->stopUsingRegister(loopCounter);
    cg->stopUsingRegister(loadLength);
@@ -7228,10 +7339,14 @@ J9::Z::TreeEvaluator::ArrayStoreCHKEvaluator(TR::Node * node, TR::CodeGenerator 
       */
       if (firstChild->getFirstChild()->isDataAddrPointer())
          dstArrayNode = firstChild->getFirstChild()->getFirstChild();
-      else
+      else if (firstChild->getFirstChild()->getOpCodeValue() == TR::aladd && firstChild->getFirstChild()->getFirstChild()->isDataAddrPointer())
          {
          dstArrayNode = firstChild->getFirstChild()->getFirstChild()->getFirstChild();
          offsetNode = firstChild->getFirstChild()->getSecondChild();
+         }
+      else
+         {
+         TR_ASSERT_FATAL(false, "Unexpected array access tree shape for OffHeap in ArrayStoreCHKEvaluator");
          }
 
       cg->evaluate(dstArrayNode);
@@ -11045,7 +11160,10 @@ J9::Z::TreeEvaluator::VMnewEvaluator(TR::Node * node, TR::CodeGenerator * cg)
 
                TR::Register *offsetReg = cg->allocateRegister();
                iCursor = generateRRInstruction(cg, TR::InstOpCode::getXORRegOpCode(), node, offsetReg, offsetReg, iCursor);
-               iCursor = generateRILInstruction(cg, TR::InstOpCode::getCmpImmOpCode(), node, enumReg, 0, iCursor);
+               /* Use 32 bit compare because the upper half can either be NULL/garbage/J9class pointer
+                * and array size should always be in 32-63 bits of enumReg.
+                */
+               iCursor = generateRIInstruction(cg, TR::InstOpCode::CHI, node, enumReg, 0, iCursor);
 
                // Load address of first array element
                iCursor = generateRXInstruction(cg,
@@ -14327,10 +14445,26 @@ J9::Z::TreeEvaluator::inlineIntegerToCharsForLatin1Strings(TR::Node *node, TR::C
    TR::Register *inputValueReg = cg->evaluate(inputValueNode);
    TR::Register *stringSizeReg = cg->gprClobberEvaluate(stringSizeNode, true);
    TR::Register *byteArrayReg = cg->gprClobberEvaluate(byteArrayNode, true);
+   // Offset to be added to array object pointer to get to the data elements
+   int32_t offsetToDataElements = static_cast<int32_t>(TR::Compiler->om.contiguousArrayHeaderSizeInBytes());
+#ifdef J9VM_GC_SPARSE_HEAP_ALLOCATION
+   if (TR::Compiler->om.isOffHeapAllocationEnabled())
+      {
+      // Load first data element address
+      generateRXInstruction(cg,
+         TR::InstOpCode::getLoadOpCode(),
+         byteArrayNode,
+         byteArrayReg,
+         generateS390MemoryReference(byteArrayReg, cg->comp()->fej9()->getOffsetOfContiguousDataAddrField(), cg));
+
+      // Since the first data element address is retrieved from the array header, the offset is set to 0
+      offsetToDataElements = 0;
+      }
+#endif /* J9VM_GC_SPARSE_HEAP_ALLOCATION */
 
    bool inputIs64Bit = inputValueNode->getDataType() == TR::Int64;
 
-   TR::MemoryReference *destinationArrayMemRef = generateS390MemoryReference(byteArrayReg, TR::Compiler->om.contiguousArrayHeaderSizeInBytes(), cg);
+   TR::MemoryReference *destinationArrayMemRef = generateS390MemoryReference(byteArrayReg, offsetToDataElements, cg);
 
    TR::LabelSymbol *cFlowRegionStart = generateLabelSymbol(cg);
    cFlowRegionStart->setStartInternalControlFlow();
@@ -14501,6 +14635,22 @@ J9::Z::TreeEvaluator::inlineIntegerToCharsForUTF16Strings(TR::Node *node, TR::Co
    TR::Register *inputValueReg = cg->evaluate(inputValueNode);
    TR::Register *stringSizeReg = cg->gprClobberEvaluate(stringSizeNode, true);
    TR::Register *byteArrayReg = cg->gprClobberEvaluate(byteArrayNode, true);
+   // Offset to be added to array object pointer to get to the data elements
+   int32_t offsetToDataElements = static_cast<int32_t>(TR::Compiler->om.contiguousArrayHeaderSizeInBytes());
+#ifdef J9VM_GC_SPARSE_HEAP_ALLOCATION
+   if (TR::Compiler->om.isOffHeapAllocationEnabled())
+      {
+      // Load first data element address
+      generateRXInstruction(cg,
+         TR::InstOpCode::getLoadOpCode(),
+         byteArrayNode,
+         byteArrayReg,
+         generateS390MemoryReference(byteArrayReg, cg->comp()->fej9()->getOffsetOfContiguousDataAddrField(), cg));
+
+      // Since the first data element address is retrieved from the array header, the offset is set to 0
+      offsetToDataElements = 0;
+      }
+#endif /* J9VM_GC_SPARSE_HEAP_ALLOCATION */
 
    bool inputIs64Bit = inputValueNode->getDataType() == TR::Int64;
 
@@ -14515,7 +14665,7 @@ J9::Z::TreeEvaluator::inlineIntegerToCharsForUTF16Strings(TR::Node *node, TR::Co
    TR::Register *numCharsRemainingReg = cg->allocateRegister(); // this is also the index of the position of the first char after we have populated the buffer
    TR::LabelSymbol *nonZeroInputLabel = generateLabelSymbol(cg);
    generateS390CompareAndBranchInstruction(cg, inputIs64Bit ? TR::InstOpCode::CG : TR::InstOpCode::C, node, inputValueReg, 0, TR::InstOpCode::COND_BNE, nonZeroInputLabel, false);
-   TR::MemoryReference *destinationArrayMemRef = generateS390MemoryReference(byteArrayReg, TR::Compiler->om.contiguousArrayHeaderSizeInBytes(), cg);
+   TR::MemoryReference *destinationArrayMemRef = generateS390MemoryReference(byteArrayReg, offsetToDataElements, cg);
    generateSILInstruction(cg, TR::InstOpCode::MVHHI, node, destinationArrayMemRef, 48);
    generateS390BranchInstruction(cg, TR::InstOpCode::BRC, TR::InstOpCode::COND_BRC, node, cFlowRegionEnd);
 

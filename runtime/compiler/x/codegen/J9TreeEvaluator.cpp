@@ -3006,10 +3006,50 @@ TR::Register *J9::X86::TreeEvaluator::ArrayStoreCHKEvaluator(TR::Node *node, TR:
    // -------------------------------------------------------------------------
 
    TR::MemoryReference *tempMR = NULL;
+   TR::Node *dstArrayNode, *offsetNode = NULL;
 
-   if (generateWriteBarrier && !deferDestinationEvaluation)
+   if (generateWriteBarrier)
       {
-      tempMR = generateX86MemoryReference(firstChild, cg);
+      if (!deferDestinationEvaluation)
+         {
+         tempMR = generateX86MemoryReference(firstChild, cg);
+         }
+      else
+         {
+         /* Evaluate destination subtrees
+         * ArrayStoreCHK
+         *    awrtbari  // firstChild
+         *      aloadi  <contiguousArrayDataAddrField>
+         *        aload     // dstArrayNode
+         *      ...
+         * OR
+         * ArrayStoreCHK
+         *    awrtbari  // firstChild
+         *      aladd (internalPtr )
+         *        aloadi  <contiguousArrayDataAddrField>
+         *          aload     // dstArrayNode
+         *        <offset>  // offsetNode
+         *      ...
+         */
+         if (firstChild->getFirstChild()->isDataAddrPointer())
+            dstArrayNode = firstChild->getFirstChild()->getFirstChild();
+         else if (firstChild->getFirstChild()->getOpCodeValue() == TR::aladd && firstChild->getFirstChild()->getFirstChild()->isDataAddrPointer())
+            {
+            dstArrayNode = firstChild->getFirstChild()->getFirstChild()->getFirstChild();
+            offsetNode = firstChild->getFirstChild()->getSecondChild();
+            }
+         else
+            {
+            TR_ASSERT_FATAL(false, "Unexpected array access tree shape for OffHeap in ArrayStoreCHKEvaluator");
+            }
+
+         cg->evaluate(dstArrayNode);
+         if (offsetNode &&
+               !(offsetNode->getOpCode().isLoadConst() &&
+               offsetNode->getLongInt() >= TR::getMinSigned<TR::Int32>() &&
+               offsetNode->getLongInt() <= TR::getMaxSigned<TR::Int32>()))
+            cg->evaluate(offsetNode);
+         }
       }
 
    TR::Node *destinationChild = firstChild->getChild(2);
@@ -3232,7 +3272,7 @@ TR::Register *J9::X86::TreeEvaluator::ArrayStoreCHKEvaluator(TR::Node *node, TR:
    //
    // -------------------------------------------------------------------------
 
-   TR::RegisterDependencyConditions *deps = generateRegisterDependencyConditions(12, 12, cg);
+   TR::RegisterDependencyConditions *deps = generateRegisterDependencyConditions(13, 13, cg);
    deps->unionPostCondition(destinationRegister, TR::RealRegister::NoReg, cg);
    deps->unionPostCondition(sourceRegister, TR::RealRegister::NoReg, cg);
 
@@ -3255,6 +3295,12 @@ TR::Register *J9::X86::TreeEvaluator::ArrayStoreCHKEvaluator(TR::Node *node, TR:
       if (tempMR->getIndexRegister() && tempMR->getIndexRegister() != destinationRegister)
          {
          deps->unionPostCondition(tempMR->getIndexRegister(), TR::RealRegister::NoReg, cg);
+         }
+
+      if (deferDestinationEvaluation && dstArrayNode->getRegister() != destinationRegister)
+         {
+         // For OffHeap tempMR->getBaseRegister() would be the dataAddrPtr not the baseArray.
+         deps->unionPostCondition(dstArrayNode->getRegister(), TR::RealRegister::NoReg, cg);
          }
 
       if (comp->target().is64Bit())
@@ -7479,7 +7525,8 @@ static void handleOffHeapDataForArrays(
 
       TR::Register *discontiguousDataAddrOffsetReg = srm->findOrCreateScratchRegister();
       generateRegRegInstruction(TR::InstOpCode::XOR4RegReg, node, discontiguousDataAddrOffsetReg, discontiguousDataAddrOffsetReg, cg);
-      generateRegImmInstruction(TR::InstOpCode::CMPRegImm4(), node, sizeReg, 1, cg);
+      // Since array size is capped at 32 bits, we only need to check lower half (0-31 bits) of sizeReg.
+      generateRegImmInstruction(TR::InstOpCode::CMP4RegImm4, node, sizeReg, 1, cg);
       generateRegImmInstruction(TR::InstOpCode::ADCRegImm4(), node, discontiguousDataAddrOffsetReg, 0, cg);
 
       dataAddrMR = generateX86MemoryReference(targetReg, discontiguousDataAddrOffsetReg, 3, TR::Compiler->om.contiguousArrayHeaderSizeInBytes(), cg);
@@ -7490,7 +7537,8 @@ static void handleOffHeapDataForArrays(
       // Clear out tempReg if dealing with 0 length array
       zeroReg = srm->findOrCreateScratchRegister();
       generateRegRegInstruction(TR::InstOpCode::XOR4RegReg, node, zeroReg, zeroReg, cg);
-      generateRegImmInstruction(TR::InstOpCode::CMPRegImm4(), node, sizeReg, 0, cg);
+      // Since array size is capped at 32 bits, we only need to check lower half (0-31 bits) of sizeReg.
+      generateRegRegInstruction(TR::InstOpCode::TEST4RegReg, node, sizeReg, sizeReg, cg);
       generateRegRegInstruction(TR::InstOpCode::CMOVERegReg(), node, tempReg, zeroReg, cg);
       srm->reclaimScratchRegister(zeroReg);
 
@@ -7534,7 +7582,8 @@ static void handleOffHeapDataForArrays(
          // Clear out tempReg if dealing with 0 length array
          zeroReg = srm->findOrCreateScratchRegister();
          generateRegRegInstruction(TR::InstOpCode::XORRegReg(), node, zeroReg, zeroReg, cg);
-         generateRegImmInstruction(TR::InstOpCode::CMPRegImm4(), node, sizeReg, 0, cg);
+         // Since array size is capped at 32 bits, we only need to check lower half (0-31 bits) of sizeReg.
+         generateRegRegInstruction(TR::InstOpCode::TEST4RegReg, node, sizeReg, sizeReg, cg);
          generateRegRegInstruction(TR::InstOpCode::CMOVERegReg(), node, tempReg, zeroReg, cg);
          srm->reclaimScratchRegister(zeroReg);
          }
@@ -9230,12 +9279,195 @@ TR::Register* J9::X86::TreeEvaluator::inlineMathFma(TR::Node* node, TR::CodeGene
    return result;
    }
 
+// Convert serial String.hashCode computation into vectorization copy and implement with SSE instruction
+//
+// Conversion process example:
+//
+//    str[8] = example string representing 8 characters (compressed or decompressed)
+//
+//    The serial method for creating the hash:
+//          hash = 0, offset = 0, count = 8
+//          for (int i = offset; i < offset+count; ++i) {
+//                hash = (hash << 5) - hash + str[i];
+//          }
+//
+//    Note that ((hash << 5) - hash) is equivalent to hash * 31
+//
+//    Expanding out the for loop:
+//          hash = ((((((((0*31+str[0])*31+str[1])*31+str[2])*31+str[3])*31+str[4])*31+str[5])*31+str[6])*31+str[7])
+//
+//    Simplified:
+//          hash =        (31^7)*str[0] + (31^6)*str[1] + (31^5)*str[2] + (31^4)*str[3]
+//                      + (31^3)*str[4] + (31^2)*str[5] + (31^1)*str[6] + (31^0)*str[7]
+//
+//    Rearranged:
+//          hash =        (31^7)*str[0] + (31^3)*str[4]
+//                      + (31^6)*str[1] + (31^2)*str[5]
+//                      + (31^5)*str[2] + (31^1)*str[6]
+//                      + (31^4)*str[3] + (31^0)*str[7]
+//
+//    Factor out [31^3, 31^2, 31^1, 31^0]:
+//          hash =        31^3*((31^4)*str[0] + str[4])           Vector[0]
+//                      + 31^2*((31^4)*str[1] + str[5])           Vector[1]
+//                      + 31^1*((31^4)*str[2] + str[6])           Vector[2]
+//                      + 31^0*((31^4)*str[3] + str[7])           Vector[3]
+//
+//    Keep factoring out any 31^4 if possible (this example has no such case). If the string was 12 characters long then:
+//          31^3*((31^8)*str[0] + (31^4)*str[4] + (31^0)*str[8]) would become 31^3*(31^4((31^4)*str[0] + str[4]) + (31^0)*str[8])
+//
+//    Vectorization is done by simultaneously calculating the four sums that hash is made of (each -> is a successive step):
+//          Vector[0] = str[0] -> multiply 31^4 -> add str[4] -> multiply 31^3
+//          Vector[1] = str[1] -> multiply 31^4 -> add str[5] -> multiply 31^2
+//          Vector[2] = str[2] -> multiply 31^4 -> add str[6] -> multiply 31^1
+//          Vector[3] = str[3] -> multiply 31^4 -> add str[7] -> multiply 1
+//
+//    Adding these four vectorized values together produces the required hash.
+//    If the number of characters in the string is not a multiple of 4, then the remainder of the hash is calculated serially.
+//
+// Implementation overview:
+//
+// start_label
+// if size < threshold, goto serial_label, current threshold is 4
+//    xmm0 = load 16 bytes align constant [923521, 923521, 923521, 923521]
+//    xmm1 = 0
+// SSEloop
+//    xmm2 = decompressed: load 8 byte value in lower 8 bytes.
+//           compressed: load 4 byte value in lower 4 bytes
+//    xmm1 = xmm1 * xmm0
+//    if(isCompressed)
+//          movzxbd xmm2, xmm2
+//    else
+//          movzxwd xmm2, xmm2
+//    xmm1 = xmm1 + xmm2
+//    i = i + 4;
+//    cmp i, end -3
+//    jge SSEloop
+// xmm0 = load 16 bytes align [31^3, 31^2, 31, 1]
+// xmm1 = xmm1 * xmm0      value contains [a0, a1, a2, a3]
+// xmm0 = xmm1
+// xmm0 = xmm0 >> 64 bits
+// xmm1 = xmm1 + xmm0       reduce add [a0+a2, a1+a3, .., ...]
+// xmm0 = xmm1
+// xmm0 = xmm0 >> 32 bits
+// xmm1 = xmm1 + xmm0       reduce add [a0+a2 + a1+a3, .., .., ..]
+// movd xmm1, GPR1
+//
+// serial_label
+//
+// cmp i end
+// jle end
+// serial_loop
+// GPR2 = GPR1
+// GPR1 = GPR1 << 5
+// GPR1 = GPR1 - GPR2
+// GPR2 = load c[i]
+// add GPR1, GPR2
+// dec i
+// cmp i, end
+// jl serial_loop
+//
+// end_label
 static TR::Register* inlineStringHashCode(TR::Node* node, bool isCompressed, TR::CodeGenerator* cg)
    {
-   TR::Register *hashResult = TR::TreeEvaluator::vectorizedHashCodeHelper(node, isCompressed ? TR::Int8 : TR::Int16, NULL, false, cg);
-   node->setRegister(hashResult);
+   TR_ASSERT(node->getChild(1)->getOpCodeValue() == TR::iconst && node->getChild(1)->getInt() == 0, "String hashcode offset can only be const zero.");
 
-   return hashResult;
+   const int size = 4;
+   auto shift = isCompressed ? 0 : 1;
+
+   auto address = cg->evaluate(node->getChild(0));
+   auto length = cg->evaluate(node->getChild(2));
+   auto index = cg->allocateRegister();
+   auto hash = cg->allocateRegister();
+   auto tmp = cg->allocateRegister();
+   auto hashXMM = cg->allocateRegister(TR_VRF);
+   auto tmpXMM = cg->allocateRegister(TR_VRF);
+   auto multiplierXMM = cg->allocateRegister(TR_VRF);
+
+   auto begLabel = generateLabelSymbol(cg);
+   auto endLabel = generateLabelSymbol(cg);
+   auto loopLabel = generateLabelSymbol(cg);
+   begLabel->setStartInternalControlFlow();
+   endLabel->setEndInternalControlFlow();
+   auto deps = generateRegisterDependencyConditions((uint8_t)6, (uint8_t)6, cg);
+   deps->addPreCondition(address, TR::RealRegister::NoReg, cg);
+   deps->addPreCondition(index, TR::RealRegister::NoReg, cg);
+   deps->addPreCondition(length, TR::RealRegister::NoReg, cg);
+   deps->addPreCondition(multiplierXMM, TR::RealRegister::NoReg, cg);
+   deps->addPreCondition(tmpXMM, TR::RealRegister::NoReg, cg);
+   deps->addPreCondition(hashXMM, TR::RealRegister::NoReg, cg);
+   deps->addPostCondition(address, TR::RealRegister::NoReg, cg);
+   deps->addPostCondition(index, TR::RealRegister::NoReg, cg);
+   deps->addPostCondition(length, TR::RealRegister::NoReg, cg);
+   deps->addPostCondition(multiplierXMM, TR::RealRegister::NoReg, cg);
+   deps->addPostCondition(tmpXMM, TR::RealRegister::NoReg, cg);
+   deps->addPostCondition(hashXMM, TR::RealRegister::NoReg, cg);
+
+   generateRegRegInstruction(TR::InstOpCode::MOV4RegReg, node, index, length, cg);
+   generateRegImmInstruction(TR::InstOpCode::AND4RegImms, node, index, size-1, cg); // mod size
+   generateRegMemInstruction(TR::InstOpCode::CMOVE4RegMem, node, index, generateX86MemoryReference(cg->findOrCreate4ByteConstant(node, size), cg), cg);
+
+   // Prepend zeros
+   {
+   TR::Compilation *comp = cg->comp();
+
+   static uint64_t MASKDECOMPRESSED[] = { 0x0000000000000000ULL, 0xffffffffffffffffULL };
+   static uint64_t MASKCOMPRESSED[]   = { 0xffffffff00000000ULL, 0x0000000000000000ULL };
+   generateRegMemInstruction(isCompressed ? TR::InstOpCode::MOVDRegMem : TR::InstOpCode::MOVQRegMem, node, hashXMM, generateX86MemoryReference(address, index, shift, -(size << shift) + TR::Compiler->om.contiguousArrayHeaderSizeInBytes(), cg), cg);
+   generateRegMemInstruction(TR::InstOpCode::LEARegMem(), node, tmp, generateX86MemoryReference(cg->findOrCreate16ByteConstant(node, isCompressed ? MASKCOMPRESSED : MASKDECOMPRESSED), cg), cg);
+
+   auto mr = generateX86MemoryReference(tmp, index, shift, 0, cg);
+   if (comp->target().cpu.supportsAVX())
+      {
+      generateRegMemInstruction(TR::InstOpCode::PANDRegMem, node, hashXMM, mr, cg);
+      }
+   else
+      {
+      generateRegMemInstruction(TR::InstOpCode::MOVDQURegMem, node, tmpXMM, mr, cg);
+      generateRegRegInstruction(TR::InstOpCode::PANDRegReg, node, hashXMM, tmpXMM, cg);
+      }
+   generateRegRegInstruction(isCompressed ? TR::InstOpCode::PMOVZXBDRegReg : TR::InstOpCode::PMOVZXWDRegReg, node, hashXMM, hashXMM, cg);
+   }
+
+   // Reduction Loop
+   {
+   static uint32_t multiplier[] = { 31*31*31*31, 31*31*31*31, 31*31*31*31, 31*31*31*31 };
+   generateLabelInstruction(TR::InstOpCode::label, node, begLabel, cg);
+   generateRegRegInstruction(TR::InstOpCode::CMP4RegReg, node, index, length, cg);
+   generateLabelInstruction(TR::InstOpCode::JGE4, node, endLabel, cg);
+   generateRegMemInstruction(TR::InstOpCode::MOVDQURegMem, node, multiplierXMM, generateX86MemoryReference(cg->findOrCreate16ByteConstant(node, multiplier), cg), cg);
+   generateLabelInstruction(TR::InstOpCode::label, node, loopLabel, cg);
+   generateRegRegInstruction(TR::InstOpCode::PMULLDRegReg, node, hashXMM, multiplierXMM, cg);
+   generateRegMemInstruction(isCompressed ? TR::InstOpCode::PMOVZXBDRegMem : TR::InstOpCode::PMOVZXWDRegMem, node, tmpXMM, generateX86MemoryReference(address, index, shift, TR::Compiler->om.contiguousArrayHeaderSizeInBytes(), cg), cg);
+   generateRegImmInstruction(TR::InstOpCode::ADD4RegImms, node, index, 4, cg);
+   generateRegRegInstruction(TR::InstOpCode::PADDDRegReg, node, hashXMM, tmpXMM, cg);
+   generateRegRegInstruction(TR::InstOpCode::CMP4RegReg, node, index, length, cg);
+   generateLabelInstruction(TR::InstOpCode::JL4, node, loopLabel, cg);
+   generateLabelInstruction(TR::InstOpCode::label, node, endLabel, deps, cg);
+   }
+
+   // Finalization
+   {
+   static uint32_t multiplier[] = { 31*31*31, 31*31, 31, 1 };
+   generateRegMemInstruction(TR::InstOpCode::PMULLDRegMem, node, hashXMM, generateX86MemoryReference(cg->findOrCreate16ByteConstant(node, multiplier), cg), cg);
+   generateRegRegImmInstruction(TR::InstOpCode::PSHUFDRegRegImm1, node, tmpXMM, hashXMM, 0x0e, cg);
+   generateRegRegInstruction(TR::InstOpCode::PADDDRegReg, node, hashXMM, tmpXMM, cg);
+   generateRegRegImmInstruction(TR::InstOpCode::PSHUFDRegRegImm1, node, tmpXMM, hashXMM, 0x01, cg);
+   generateRegRegInstruction(TR::InstOpCode::PADDDRegReg, node, hashXMM, tmpXMM, cg);
+   }
+
+   generateRegRegInstruction(TR::InstOpCode::MOVDReg4Reg, node, hash, hashXMM, cg);
+
+   cg->stopUsingRegister(index);
+   cg->stopUsingRegister(tmp);
+   cg->stopUsingRegister(hashXMM);
+   cg->stopUsingRegister(tmpXMM);
+   cg->stopUsingRegister(multiplierXMM);
+
+   node->setRegister(hash);
+   cg->decReferenceCount(node->getChild(0));
+   cg->recursivelyDecReferenceCount(node->getChild(1));
+   cg->decReferenceCount(node->getChild(2));
+   return hash;
    }
 
 TR::Register* J9::X86::TreeEvaluator::inlineVectorizedHashCode(TR::Node* node, TR::CodeGenerator* cg)
@@ -12036,14 +12268,14 @@ J9::X86::TreeEvaluator::directCallEvaluator(TR::Node *node, TR::CodeGenerator *c
          return TR::TreeEvaluator::encodeUTF16Evaluator(node, cg);
 
       case TR::java_lang_String_hashCodeImplDecompressed:
-         if (cg->getSupportsInlineStringHashCode() && !node->getBlock()->isCold())
+         if (cg->getSupportsInlineStringHashCode())
             returnRegister = inlineStringHashCode(node, false, cg);
 
          callInlined = (returnRegister != NULL);
          break;
 
       case TR::java_lang_String_hashCodeImplCompressed:
-         if (cg->getSupportsInlineStringHashCode() && !node->getBlock()->isCold())
+         if (cg->getSupportsInlineStringHashCode())
             returnRegister = inlineStringHashCode(node, true, cg);
 
          callInlined = (returnRegister != NULL);

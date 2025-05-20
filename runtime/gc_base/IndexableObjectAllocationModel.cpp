@@ -73,7 +73,7 @@ MM_IndexableObjectAllocationModel::initializeAllocateDescription(MM_EnvironmentB
 
 	case GC_ArrayletObjectModel::InlineContiguous:
 		/* Check if we're dealing with a camouflaged discontiguous array - these arrays will require slow-path allocate */
-		if (isVirtualLargeObjectHeapEnabled && (!extensions->indexableObjectModel.shouldDataBeAdjacentToHeader(_dataSize))) {
+		if (isVirtualLargeObjectHeapEnabled && (!_isDataAdjacent)) {
 			if (isGCAllowed()) {
 				layoutSizeInBytes = _dataSize;
 				setAllocatable(true);
@@ -145,7 +145,6 @@ MM_IndexableObjectAllocationModel::initializeIndexableObject(MM_EnvironmentBase 
 	GC_ArrayObjectModel *indexableObjectModel = &extensions->indexableObjectModel;
 	J9IndexableObject *spine = (J9IndexableObject*)initializeJavaObject(env, allocatedBytes);
 	_allocateDescription.setSpine(spine);
-	bool shouldDataBeAdjacentToHeader = false;
 	bool isVirtualLargeObjectHeapEnabled = indexableObjectModel->isVirtualLargeObjectHeapEnabled();
 
 	if (NULL != spine) {
@@ -161,28 +160,24 @@ MM_IndexableObjectAllocationModel::initializeIndexableObject(MM_EnvironmentBase 
 #endif /* defined(J9VM_ENV_DATA64) */
 		} else {
 			indexableObjectModel->setSizeInElementsForContiguous(spine, _numberOfIndexedFields);
-			shouldDataBeAdjacentToHeader = indexableObjectModel->shouldDataBeAdjacentToHeader(spine);
-			if (shouldDataBeAdjacentToHeader) {
 #if defined(J9VM_ENV_DATA64)
-				if (((J9JavaVM *)env->getLanguageVM())->isIndexableDataAddrPresent) {
+			if (((J9JavaVM *)env->getLanguageVM())->isIndexableDataAddrPresent) {
+				if (_isDataAdjacent) {
 					indexableObjectModel->setDataAddrForContiguous(spine);
+				} else {
+					/* Set NULL temporarily to avoid possible complication with GC occurring while the object is partially initialized. */
+					indexableObjectModel->setDataAddrForContiguous(spine, NULL);
 				}
-#endif /* defined(J9VM_ENV_DATA64) */
-			} else if (isVirtualLargeObjectHeapEnabled) {
-#if defined(J9VM_ENV_DATA64)
-				/* Set NULL temporarily to avoid possible complication with GC occurring while the object is partially initialized? */
-				indexableObjectModel->setDataAddrForContiguous(spine, NULL);
-#endif /* defined(J9VM_ENV_DATA64) */
 			}
+#endif /* defined(J9VM_ENV_DATA64) */
 		}
 	}
-
 
 	/* Lay out arraylet and arrayoid pointers */
 	switch (_layout) {
 	case GC_ArrayletObjectModel::InlineContiguous:
 #if defined(J9VM_GC_SPARSE_HEAP_ALLOCATION)
-		if (isVirtualLargeObjectHeapEnabled && !shouldDataBeAdjacentToHeader) {
+		if (isVirtualLargeObjectHeapEnabled && !_isDataAdjacent) {
 			/* We still need to create leaves for discontiguous arrays that will be allocated at off-heap. */
 			spine = getSparseAddressAndDecommitLeaves(env, spine);
 			if (NULL != spine) {
@@ -190,7 +185,7 @@ MM_IndexableObjectAllocationModel::initializeIndexableObject(MM_EnvironmentBase 
 			}
 		}
 #endif /* defined (J9VM_GC_SPARSE_HEAP_ALLOCATION) */
-		if (!isVirtualLargeObjectHeapEnabled || shouldDataBeAdjacentToHeader) {
+		if (!isVirtualLargeObjectHeapEnabled || _isDataAdjacent) {
 			Assert_MM_true(1 == _numberOfArraylets);
 		}
 		break;
@@ -401,11 +396,10 @@ MM_IndexableObjectAllocationModel::getSparseAddressAndDecommitLeaves(MM_Environm
 		void *virtualLargeObjectHeapAddress = extensions->largeObjectVirtualMemory->allocateSparseFreeEntryAndMapToHeapObject(spine, byteAmount);
 		if (NULL != virtualLargeObjectHeapAddress) {
 			indexableObjectModel->setDataAddrForContiguous((J9IndexableObject *)spine, virtualLargeObjectHeapAddress);
+		} else {
+			_allocateDescription.setSpine(NULL);
+			spine = NULL;
 		}
-		/*
-		 * TODO:we might need a special state for this regions (different from just plain ARRAYLET),
-		 * such as ARRAYLET_DECOMMITED or just DECOMMITED
-		 */
 	}
 
 	Trc_MM_getSparseAddressAndDecommitLeaves_Exit(env->getLanguageVMThread(), spine, (void *)bytesRemaining);

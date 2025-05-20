@@ -4313,7 +4313,9 @@ JavaCoreDumpWriter::writeMonitorObject(J9ThreadMonitor* monitor, j9object_t obj,
 	if (NULL != obj) {
 		owner = getObjectMonitorOwner(_VirtualMachine, obj, &count);
 	} else if (NULL != lockOwner) {
-		owner = getVMThreadFromOMRThread(_VirtualMachine, lockOwner);
+		if (!IS_J9_OBJECT_MONITOR_OWNER_DETACHED(lockOwner)) {
+			owner = getVMThreadFromOMRThread(_VirtualMachine, lockOwner);
+		}
 		count = lock->count;
 	}
 
@@ -4338,7 +4340,16 @@ JavaCoreDumpWriter::writeMonitorObject(J9ThreadMonitor* monitor, j9object_t obj,
 	/* Describe its owning thread */
 	bool inflated = J9_ARE_ANY_BITS_SET(lock->flags, J9THREAD_MONITOR_INFLATED);
 
-	if ((NULL != owner) || (NULL != lockOwner)) {
+	if (IS_J9_OBJECT_MONITOR_OWNER_DETACHED(lockOwner)) {
+		if (inflated) {
+			_OutputStream.writeCharacters("owner \"");
+		} else {
+			_OutputStream.writeCharacters("Flat locked by \"");
+		}
+		_OutputStream.writeCharacters("<detached virtual thread>");
+		_OutputStream.writeCharacters(", entry count ");
+		_OutputStream.writeInteger(count, "%zu");
+	} else if ((NULL != owner) || (NULL != lockOwner)) {
 		if (inflated) {
 			_OutputStream.writeCharacters("owner \"");
 		} else {
@@ -4544,6 +4555,8 @@ JavaCoreDumpWriter::writeThread(J9VMThread* vmThread, J9PlatformThread *nativeTh
 		/* Replace vmstate with java state in the "3XMTHREADINFO" entry */
 		_OutputStream.writeCharacters(", state:");
 		writeThreadState(javaState);
+		_OutputStream.writeCharacters(", rawStateValue:");
+		_OutputStream.writeInteger(javaState);
 
 		_OutputStream.writeCharacters(", prio=");
 		_OutputStream.writeInteger(javaPriority, "%zu");
@@ -5785,6 +5798,7 @@ spaceIteratorCallback(J9JavaVM* virtualMachine, J9MM_IterateSpaceDescriptor* spa
 	UDATA sizeTarget = 0;
 	UDATA allocTotal = 0;
 	UDATA freeTotal = 0;
+	UDATA offheapUsage = 0;
 #if defined (J9VM_GC_VLHGC)
 	regioniterationblock regionTotals;
 #endif /* J9VM_GC_VLHGC */
@@ -5840,6 +5854,23 @@ spaceIteratorCallback(J9JavaVM* virtualMachine, J9MM_IterateSpaceDescriptor* spa
 		jcw->_OutputStream.writeCharacters(" ");
 		jcw->_OutputStream.writeCharacters(spaceDescriptor->name);
 		jcw->_OutputStream.writeCharacters("\n");
+
+		if (virtualMachine->memoryManagerFunctions->j9gc_off_heap_allocation_enabled(virtualMachine)) {
+			void *offheapControlStructure = NULL;
+			void *offheapBase = NULL;
+			void *offheapTop = NULL;
+			virtualMachine->memoryManagerFunctions->j9gc_get_offheap_data(virtualMachine, &offheapControlStructure, &offheapBase, &offheapTop, &offheapUsage);
+
+			jcw->_OutputStream.writeCharacters("1STHEAPEXT     ");
+			jcw->_OutputStream.writePointer(offheapControlStructure);
+			jcw->_OutputStream.writeCharacters(" ");
+			jcw->_OutputStream.writePointer(offheapBase);
+			jcw->_OutputStream.writeCharacters(" ");
+			jcw->_OutputStream.writePointer(offheapTop);
+			jcw->_OutputStream.writeCharacters(" ");
+			jcw->_OutputStream.writeVPrintf(FORMAT_SIZE_HEX, sizeof(void *) * 2, (UDATA)offheapTop - (UDATA)offheapBase);
+			jcw->_OutputStream.writeCharacters(" VirtualLargeObjectHeap (off-heap)\n");
+		}
 #endif /* J9VM_GC_VLHGC */
 	}
 
@@ -5852,27 +5883,45 @@ spaceIteratorCallback(J9JavaVM* virtualMachine, J9MM_IterateSpaceDescriptor* spa
 
 	jcw->_OutputStream.writeCharacters("NULL\n");
 	jcw->_OutputStream.writeCharacters("1STHEAPTOTAL   ");
-	jcw->_OutputStream.writeCharacters("Total memory:        ");
+	jcw->_OutputStream.writeCharacters("Total memory:          ");
 	jcw->_OutputStream.writeVPrintf(FORMAT_SIZE_DECIMAL, decimalLength, sizeTotal);
 	jcw->_OutputStream.writeCharacters(" (");
 	jcw->_OutputStream.writeVPrintf(FORMAT_SIZE_HEX, sizeof(void *) * 2, sizeTotal);
 	jcw->_OutputStream.writeCharacters(")\n");
 	if (0 != sizeTarget) {
 		jcw->_OutputStream.writeCharacters("1STHEAPTARGET  ");
-		jcw->_OutputStream.writeCharacters("Target memory:       ");
+		jcw->_OutputStream.writeCharacters("Target memory:         ");
 		jcw->_OutputStream.writeVPrintf(FORMAT_SIZE_DECIMAL, decimalLength, sizeTarget);
 		jcw->_OutputStream.writeCharacters(" (");
 		jcw->_OutputStream.writeVPrintf(FORMAT_SIZE_HEX, sizeof(void *) * 2, sizeTarget);
 		jcw->_OutputStream.writeCharacters(")\n");
 	}
 	jcw->_OutputStream.writeCharacters("1STHEAPINUSE   ");
-	jcw->_OutputStream.writeCharacters("Total memory in use: ");
+	jcw->_OutputStream.writeCharacters("Total memory in use:   ");
 	jcw->_OutputStream.writeVPrintf(FORMAT_SIZE_DECIMAL, decimalLength, allocTotal);
 	jcw->_OutputStream.writeCharacters(" (");
 	jcw->_OutputStream.writeVPrintf(FORMAT_SIZE_HEX, sizeof(void *) * 2, allocTotal);
 	jcw->_OutputStream.writeCharacters(")\n");
+	if (virtualMachine->memoryManagerFunctions->j9gc_off_heap_allocation_enabled(virtualMachine)) {
+		jcw->_OutputStream.writeCharacters("2STHEAPSPCUSE  ");
+		jcw->_OutputStream.writeCharacters(spaceDescriptor->name);
+		jcw->_OutputStream.writeCharacters(" memory in use:");
+		jcw->_OutputStream.writeVPrintf(
+				FORMAT_SIZE_DECIMAL,
+				decimalLength + LITERAL_STRLEN("Off-heap") - strlen(spaceDescriptor->name),
+				allocTotal - offheapUsage);
+		jcw->_OutputStream.writeCharacters(" (");
+		jcw->_OutputStream.writeVPrintf(FORMAT_SIZE_HEX, sizeof(void *) * 2, allocTotal - offheapUsage);
+		jcw->_OutputStream.writeCharacters(")\n");
+		jcw->_OutputStream.writeCharacters("2STHEAPEXTUSE  ");
+		jcw->_OutputStream.writeCharacters("Off-heap memory in use:");
+		jcw->_OutputStream.writeVPrintf(FORMAT_SIZE_DECIMAL, decimalLength, offheapUsage);
+		jcw->_OutputStream.writeCharacters(" (");
+		jcw->_OutputStream.writeVPrintf(FORMAT_SIZE_HEX, sizeof(void *) * 2, offheapUsage);
+		jcw->_OutputStream.writeCharacters(")\n");
+	}
 	jcw->_OutputStream.writeCharacters("1STHEAPFREE    ");
-	jcw->_OutputStream.writeCharacters("Total memory free:   ");
+	jcw->_OutputStream.writeCharacters("Total memory free:     ");
 	jcw->_OutputStream.writeVPrintf(FORMAT_SIZE_DECIMAL, decimalLength, freeTotal);
 	jcw->_OutputStream.writeCharacters(" (");
 	jcw->_OutputStream.writeVPrintf(FORMAT_SIZE_HEX, sizeof(void *) * 2, freeTotal);

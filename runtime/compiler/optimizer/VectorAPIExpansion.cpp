@@ -28,7 +28,6 @@
 #include "compile/ResolvedMethod.hpp"
 #include "env/StackMemoryRegion.hpp"
 #include "env/TypeLayout.hpp"
-#include "env/VerboseLog.hpp"
 #include "env/VMAccessCriticalSection.hpp"
 #include "il/Node.hpp"
 #include "il/Node_inlines.hpp"
@@ -1550,11 +1549,27 @@ TR_VectorAPIExpansion::unboxNode(TR::Node *parentNode, TR::Node *operand, vapiOb
    bool parentScalarized;
    bool parentVectorizedOrScalarized = isVectorizedOrScalarizedNode(parentNode, elementType, bitsLength,
                                                                     parentType, parentScalarized);
+   int32_t elementSize = OMR::DataType::getSize(elementType);
+   int32_t numLanes = bitsLength/8/elementSize;
+   TR::VectorLength vectorLength = OMR::DataType::bitsToVectorLength(bitsLength);
+   TR::ILOpCodes maskLoadOpCode;
+   TR::ILOpCodes maskConv;
+   bool unboxingSupported = true;
 
    if ((operandObjectType != Vector && operandObjectType != Mask) ||
-        elementType != TR::Int8 ||
-        bitsLength != 128 ||
-        parentScalarized)  // TODO: support unboxing into scalars
+       elementType != TR::Int8 ||   // TODO: support more types (needs support in createClassesForBoxing)
+       bitsLength != 128 ||
+       parentScalarized)            // TODO: support unboxing into scalars
+      {
+      unboxingSupported = false;
+      }
+   else if (operandObjectType == Mask)
+      {
+      maskConv = getLoadToMaskConversion(numLanes, TR::DataType::createMaskType(elementType, vectorLength), maskLoadOpCode);
+      unboxingSupported = isOpCodeImplemented(comp(), maskConv);
+      }
+
+   if (!unboxingSupported)
       {
       TR_ASSERT_FATAL(checkBoxing, "Incorrect unboxing type can only be encountered during check mode");
 
@@ -1575,7 +1590,6 @@ TR_VectorAPIExpansion::unboxNode(TR::Node *parentNode, TR::Node *operand, vapiOb
    TR_ASSERT_FATAL(parentVectorizedOrScalarized, "Node %p should be vectorized or scalarized", parentNode);
 
    TR::DataType opCodeType = TR::NoType;
-   TR::VectorLength vectorLength = OMR::DataType::bitsToVectorLength(bitsLength);
 
    if (operandObjectType == Vector)
       {
@@ -1598,12 +1612,19 @@ TR_VectorAPIExpansion::unboxNode(TR::Node *parentNode, TR::Node *operand, vapiOb
    payloadLoad->setAndIncChild(0, operand);
 
 
-   TR::ILOpCodes opcode = TR::ILOpCode::createVectorOpCode(opCodeType.isVector() ? TR::vloadi : TR::mloadi, opCodeType);
+   TR::ILOpCodes opcode = operandObjectType == Vector ?
+                          TR::ILOpCode::createVectorOpCode(TR::vloadi, opCodeType)
+                          : maskLoadOpCode;
+
    TR::SymbolReference *vectorShadow = comp()->getSymRefTab()->findOrCreateArrayShadowSymbolRef(opCodeType, NULL);
    TR::Node *newOperand = TR::Node::createWithSymRef(operand, opcode, 1, vectorShadow);
-   int32_t elementSize = OMR::DataType::getSize(elementType);
    TR::Node *aladdNode = generateArrayElementAddressNode(comp(), payloadLoad, TR::Node::iconst(operand, 0), elementSize);
    newOperand->setAndIncChild(0, aladdNode);
+
+   if (operandObjectType == Mask)
+      {
+      newOperand = TR::Node::create(operand, maskConv, 1, newOperand);
+      }
 
    if (_trace)
       traceMsg(comp(), "Unboxed: node %p into new node %p for parent %p\n", operand, newOperand, parentNode);
@@ -2211,6 +2232,46 @@ void TR_VectorAPIExpansion::astoreHandler(TR_VectorAPIExpansion *opt, TR::TreeTo
    return;
    }
 
+TR::ILOpCodes
+TR_VectorAPIExpansion::getLoadToMaskConversion(int32_t numLanes, TR::DataType maskType, TR::ILOpCodes &loadOpCode)
+   {
+   TR::ILOpCodes op;
+
+   switch (numLanes)
+      {
+      case 1:
+         op = TR::ILOpCode::createVectorOpCode(TR::b2m, maskType);
+         loadOpCode = TR::bloadi;
+         break;
+      case 2:
+         op = TR::ILOpCode::createVectorOpCode(TR::s2m, maskType);
+         loadOpCode = TR::sloadi;
+         break;
+      case 4:
+         op = TR::ILOpCode::createVectorOpCode(TR::i2m, maskType);
+         loadOpCode = TR::iloadi;
+         break;
+      case 8:
+         op = TR::ILOpCode::createVectorOpCode(TR::l2m, maskType);
+         loadOpCode = TR::lloadi;
+         break;
+      case 16:
+      case 32:
+      case 64:
+         {
+         TR::VectorLength vectorLength = OMR::DataType::bitsToVectorLength(numLanes*8);
+         TR::DataType sourceType = TR::DataType::createVectorType(TR::Int8, vectorLength);
+         op = TR::ILOpCode::createVectorOpCode(TR::v2m, sourceType, maskType);
+         loadOpCode = TR::ILOpCode::createVectorOpCode(TR::vloadi, sourceType);
+         break;
+         }
+      default:
+         TR_ASSERT_FATAL(false, "Unsupported number of lanes (%d) when loading a mask\n", numLanes);
+         return TR::BadILOp;
+      }
+
+   return op;
+}
 
 TR::Node *TR_VectorAPIExpansion::unsupportedHandler(TR_VectorAPIExpansion *opt, TR::TreeTop *treeTop,
                                                     TR::Node *node, TR::DataType elementType,
@@ -2242,7 +2303,7 @@ TR::Node *TR_VectorAPIExpansion::loadIntrinsicHandler(TR_VectorAPIExpansion *opt
          TR::DataType vectorType = TR::DataType::createVectorType(elementType, vectorLength);
          TR::ILOpCodes vectorOpCode = TR::ILOpCode::createVectorOpCode(TR::vloadi, vectorType);
 
-         if (!comp->cg()->getSupportsOpCodeForAutoSIMD(vectorOpCode))
+         if (!isOpCodeImplemented(comp, vectorOpCode))
             return NULL;
 
          return node;
@@ -2254,37 +2315,14 @@ TR::Node *TR_VectorAPIExpansion::loadIntrinsicHandler(TR_VectorAPIExpansion *opt
 
          TR::DataType resultType = TR::DataType::createMaskType(elementType, vectorLength);
          TR::ILOpCodes maskConversionOpCode;
+         TR::ILOpCodes unused;
 
-         switch (numLanes)
-            {
-            case 1:
-               maskConversionOpCode = TR::ILOpCode::createVectorOpCode(TR::b2m, resultType);
-               break;
-            case 2:
-               maskConversionOpCode = TR::ILOpCode::createVectorOpCode(TR::s2m, resultType);
-               break;
-            case 4:
-               maskConversionOpCode = TR::ILOpCode::createVectorOpCode(TR::i2m, resultType);
-               break;
-            case 8:
-               maskConversionOpCode = TR::ILOpCode::createVectorOpCode(TR::l2m, resultType);
-               break;
-            case 16:
-            case 32:
-            case 64:
-               {
-               TR::VectorLength vectorLength = supportedOnPlatform(comp, numLanes*8);
-               if (vectorLength == TR::NoVectorLength) return NULL;
-               TR::DataType sourceType = TR::DataType::createVectorType(TR::Int8, vectorLength);
-               maskConversionOpCode = TR::ILOpCode::createVectorOpCode(TR::v2m, sourceType, resultType);
-               break;
-               }
-            default:
-               TR_ASSERT_FATAL(false, "Unsupported number of lanes when loading a mask\n");
-               return NULL;
-            }
+         maskConversionOpCode = getLoadToMaskConversion(numLanes, resultType, unused);
 
-         if (!comp->cg()->getSupportsOpCodeForAutoSIMD(maskConversionOpCode))
+         if (maskConversionOpCode == TR::BadILOp)
+            return NULL;
+
+         if (!isOpCodeImplemented(comp, maskConversionOpCode))
             return NULL;
 
          return node;
@@ -2367,45 +2405,11 @@ TR::Node *TR_VectorAPIExpansion::transformLoadFromArray(TR_VectorAPIExpansion *o
       else if (objectType == Mask)
          {
          TR::ILOpCodes loadOpCode;
-         TR::DataType symRefType;
 
-         switch (numLanes)
-            {
-            case 1:
-               op = TR::ILOpCode::createVectorOpCode(TR::b2m, vectorType);
-               loadOpCode = TR::bloadi;
-               symRefType = TR::Int8;
-               break;
-            case 2:
-               op = TR::ILOpCode::createVectorOpCode(TR::s2m, vectorType);
-               loadOpCode = TR::sloadi;
-               symRefType = TR::Int16;
-               break;
-            case 4:
-               op = TR::ILOpCode::createVectorOpCode(TR::i2m, vectorType);
-               loadOpCode = TR::iloadi;
-               symRefType = TR::Int32;
-               break;
-            case 8:
-               op = TR::ILOpCode::createVectorOpCode(TR::l2m, vectorType);
-               loadOpCode = TR::lloadi;
-               symRefType = TR::Int64;
-               break;
-            case 16:
-            case 32:
-            case 64:
-               {
-               TR::VectorLength vectorLength = OMR::DataType::bitsToVectorLength(numLanes*8);
-               TR::DataType sourceType = TR::DataType::createVectorType(TR::Int8, vectorLength);
-               op = TR::ILOpCode::createVectorOpCode(TR::v2m, sourceType, vectorType);
-               loadOpCode = TR::ILOpCode::createVectorOpCode(TR::vloadi, sourceType);
-               symRefType = sourceType;
-               break;
-               }
-            default:
-               TR_ASSERT_FATAL(false, "Unsupported number of lanes when loading a mask\n");
-               return NULL;
-            }
+         op = getLoadToMaskConversion(numLanes, vectorType, loadOpCode);
+
+         if (op == TR::BadILOp)
+            return NULL;
 
          TR::Node::recreate(node, op);
 
@@ -2447,7 +2451,7 @@ TR::Node *TR_VectorAPIExpansion::storeIntrinsicHandler(TR_VectorAPIExpansion *op
          TR::DataType vectorType = TR::DataType::createVectorType(elementType, vectorLength);
          TR::ILOpCodes vectorOpCode = TR::ILOpCode::createVectorOpCode(TR::vstorei, vectorType);
 
-         if (!comp->cg()->getSupportsOpCodeForAutoSIMD(vectorOpCode))
+         if (!isOpCodeImplemented(comp, vectorOpCode))
             return NULL;
 
          return node;
@@ -2489,7 +2493,7 @@ TR::Node *TR_VectorAPIExpansion::storeIntrinsicHandler(TR_VectorAPIExpansion *op
                return NULL;
             }
 
-         if (!comp->cg()->getSupportsOpCodeForAutoSIMD(maskConversionOpCode))
+         if (!isOpCodeImplemented(comp, maskConversionOpCode))
             return NULL;
 
          return node;
@@ -2651,14 +2655,14 @@ TR::Node *TR_VectorAPIExpansion::unaryIntrinsicHandler(TR_VectorAPIExpansion *op
                                                        TR::DataType elementType, TR::VectorLength vectorLength, vapiObjType objectType,
                                                        int32_t numLanes, handlerMode mode)
    {
-   return naryIntrinsicHandler(opt, treeTop, node, elementType, vectorLength, objectType, numLanes, mode, 1, Other);
+   return naryIntrinsicHandler(opt, treeTop, node, elementType, vectorLength, objectType, numLanes, mode, 1, Unary);
    }
 
 TR::Node *TR_VectorAPIExpansion::binaryIntrinsicHandler(TR_VectorAPIExpansion *opt, TR::TreeTop *treeTop, TR::Node *node,
                                                         TR::DataType elementType, TR::VectorLength vectorLength, vapiObjType objectType,
                                                         int32_t numLanes, handlerMode mode)
    {
-   return naryIntrinsicHandler(opt, treeTop, node, elementType, vectorLength, objectType, numLanes, mode, 2, Other);
+   return naryIntrinsicHandler(opt, treeTop, node, elementType, vectorLength, objectType, numLanes, mode, 2, Binary);
    }
 
 TR::Node *TR_VectorAPIExpansion::maskReductionCoercedIntrinsicHandler(TR_VectorAPIExpansion *opt, TR::TreeTop *treeTop, TR::Node *node,
@@ -2680,7 +2684,7 @@ TR::Node *TR_VectorAPIExpansion::ternaryIntrinsicHandler(TR_VectorAPIExpansion *
                                                          TR::DataType elementType, TR::VectorLength vectorLength, vapiObjType objectType,
                                                          int32_t numLanes, handlerMode mode)
    {
-   return naryIntrinsicHandler(opt, treeTop, node, elementType, vectorLength, objectType, numLanes, mode, 3, Other);
+   return naryIntrinsicHandler(opt, treeTop, node, elementType, vectorLength, objectType, numLanes, mode, 3, Ternary);
    }
 
 TR::Node *TR_VectorAPIExpansion::testIntrinsicHandler(TR_VectorAPIExpansion *opt, TR::TreeTop *treeTop, TR::Node *node,
@@ -2828,13 +2832,20 @@ TR::Node *TR_VectorAPIExpansion::naryIntrinsicHandler(TR_VectorAPIExpansion *opt
             vec_sz_t bitsLength = resultNumLanesNode->get32bitIntegralValue()*8*elementSize;
 
             if (supportedOnPlatform(comp, bitsLength) == TR::NoVectorLength)
+               {
+               traceMsg(comp, "Platform does not support conversion result length %d in node %p",
+                        bitsLength, node);
                return NULL;
+               }
 
             resultVectorLength = OMR::DataType::bitsToVectorLength(bitsLength);
             }
 
          if (resultElementType == TR::NoType || resultVectorLength == TR::NoVectorLength)
+            {
+            traceMsg(comp, "Unknown conversion result type in node %p", node);
             return NULL;
+            }
          }
 
 
@@ -2855,7 +2866,7 @@ TR::Node *TR_VectorAPIExpansion::naryIntrinsicHandler(TR_VectorAPIExpansion *opt
          vectorOpCode = ILOpcodeFromVectorAPIOpcode(comp, vectorAPIOpcode, opType, vectorLength, objectType, opCodeType, withMask,
                                                     resultElementType, resultVectorLength);
 
-         if (vectorOpCode == TR::BadILOp || !comp->cg()->getSupportsOpCodeForAutoSIMD(vectorOpCode))
+         if (vectorOpCode == TR::BadILOp || !isOpCodeImplemented(comp, vectorOpCode))
             {
             if (opt->_trace) traceMsg(comp, "Unsupported vector opcode in node %p %s\n", node,
                                       vectorOpCode == TR::BadILOp ? "(no IL)" : "(no codegen)");
@@ -2867,7 +2878,7 @@ TR::Node *TR_VectorAPIExpansion::naryIntrinsicHandler(TR_VectorAPIExpansion *opt
             TR::ILOpCodes splatsOpCode = TR::ILOpCode::createVectorOpCode(TR::vsplats,
                                                                           TR::DataType::createVectorType(elementType, vectorLength));
 
-            if (!comp->cg()->getSupportsOpCodeForAutoSIMD(splatsOpCode))
+            if (!isOpCodeImplemented(comp, splatsOpCode))
                {
                if (opt->_trace) traceMsg(comp, "Unsupported vsplats opcode in node %p (no codegen)\n", node);
 
@@ -2881,8 +2892,8 @@ TR::Node *TR_VectorAPIExpansion::naryIntrinsicHandler(TR_VectorAPIExpansion *opt
             TR::ILOpCodes splatsOpCode = TR::ILOpCode::createVectorOpCode(TR::vsplats, vectorType);
             TR::ILOpCodes subOpCode = TR::ILOpCode::createVectorOpCode(TR::vsub, vectorType);
 
-            if (!comp->cg()->getSupportsOpCodeForAutoSIMD(splatsOpCode) ||
-                !comp->cg()->getSupportsOpCodeForAutoSIMD(subOpCode))
+            if (!isOpCodeImplemented(comp, splatsOpCode) ||
+                !isOpCodeImplemented(comp, subOpCode))
                {
                if (opt->_trace) traceMsg(comp, "Unsupported vsplats or vsub opcode in node %p (no codegen)\n", node);
 
@@ -2960,7 +2971,7 @@ TR::Node *TR_VectorAPIExpansion::fromBitsCoercedIntrinsicHandler(TR_VectorAPIExp
       TR::ILOpCodes splatsOpCode = TR::ILOpCode::createVectorOpCode(mask ? TR::mLongBitsToMask : TR::vsplats,
                                                                     TR::DataType::createVectorType(elementType, vectorLength));
 
-      if (!comp->cg()->getSupportsOpCodeForAutoSIMD(splatsOpCode))
+      if (!isOpCodeImplemented(comp, splatsOpCode))
          return NULL;
 
       return node;
@@ -3076,7 +3087,7 @@ TR::ILOpCodes TR_VectorAPIExpansion::ILOpcodeFromVectorAPIOpcode(TR::Compilation
        opCodeType != MaskReduction &&
        opCodeType != Compare)  // for Compare, objectType is Mask (the result) but the operands are always vectors
       {
-      return TR::BadILOp;
+      return reportMissingOpCode(comp, vectorAPIOpCode, objectType, opCodeType, withMask);
       }
 
    // TODO: support more scalarization
@@ -3091,12 +3102,17 @@ TR::ILOpCodes TR_VectorAPIExpansion::ILOpcodeFromVectorAPIOpcode(TR::Compilation
 
    if (opCodeType == Convert)
       {
+      if (scalar) return TR::BadILOp;
+
       switch (vectorAPIOpCode)
          {
-         case VECTOR_OP_CAST: return TR::BadILOp;
-         case VECTOR_OP_UCAST: return TR::BadILOp;
+         case VECTOR_OP_CAST:
+            return TR::ILOpCode::createVectorOpCode(TR::vconv, vectorType, resultVectorType);
+         case VECTOR_OP_UCAST:
+            return reportMissingOpCode(comp, vectorAPIOpCode, objectType, opCodeType, withMask);
          case VECTOR_OP_REINTERPRET:
-            if (scalar) return TR::BadILOp;
+            {
+            TR::ILOpCodes opCode = TR::ILOpCode::createVectorOpCode(TR::vcast, vectorType, resultVectorType);
 
             if (OMR::DataType::getSize(resultElementType) != OMR::DataType::getSize(elementType) ||
                 resultVectorLength != vectorLength)
@@ -3104,12 +3120,14 @@ TR::ILOpCodes TR_VectorAPIExpansion::ILOpcodeFromVectorAPIOpcode(TR::Compilation
                traceMsg(comp, "\nCalling VECTOR_OP_REINTERPRET on %s to %s in %s\n", TR::DataType::getName(vectorType),
                                                                             TR::DataType::getName(resultVectorType),
                                                                             comp->signature());
+               // produce verbose message
+               isOpCodeImplemented(comp, opCode, false);
                return TR::BadILOp;
                }
-
-            return TR::ILOpCode::createVectorOpCode(TR::vcast, vectorType, resultVectorType);
+            return opCode;
+            }
          default:
-            return TR::BadILOp;
+            return reportMissingOpCode(comp, vectorAPIOpCode, objectType, opCodeType, withMask);
          }
       }
    else if (opCodeType == Blend)
@@ -3117,7 +3135,7 @@ TR::ILOpCodes TR_VectorAPIExpansion::ILOpcodeFromVectorAPIOpcode(TR::Compilation
       if (scalar)
          return TR::BadILOp;
       else
-         return TR::ILOpCode::createVectorOpCode(TR::vbitselect, vectorType);
+         return TR::ILOpCode::createVectorOpCode(TR::vblend, vectorType);
       }
    else if ((opCodeType == Test) && withMask)
       {
@@ -3126,7 +3144,7 @@ TR::ILOpCodes TR_VectorAPIExpansion::ILOpcodeFromVectorAPIOpcode(TR::Compilation
          case BT_ne:       return scalar ? TR::BadILOp : TR::ILOpCode::createVectorOpCode(TR::mmAnyTrue, vectorType);
          case BT_overflow: return scalar ? TR::BadILOp : TR::ILOpCode::createVectorOpCode(TR::mmAllTrue, vectorType);
          default:
-            return TR::BadILOp;
+            return reportMissingOpCode(comp, vectorAPIOpCode, objectType, opCodeType, withMask);;
          }
       }
    else if ((opCodeType == BroadcastInt) && withMask)
@@ -3139,7 +3157,7 @@ TR::ILOpCodes TR_VectorAPIExpansion::ILOpcodeFromVectorAPIOpcode(TR::Compilation
          case VECTOR_OP_LROTATE: return scalar ? TR::BadILOp : TR::ILOpCode::createVectorOpCode(TR::vmrol, vectorType);
          case VECTOR_OP_RROTATE: return scalar ? TR::BadILOp : TR::ILOpCode::createVectorOpCode(TR::vmrol, vectorType);
          default:
-            return TR::BadILOp;
+            return reportMissingOpCode(comp, vectorAPIOpCode, objectType, opCodeType, withMask);
          }
       }
    else if (opCodeType == BroadcastInt)
@@ -3152,7 +3170,7 @@ TR::ILOpCodes TR_VectorAPIExpansion::ILOpcodeFromVectorAPIOpcode(TR::Compilation
          case VECTOR_OP_LROTATE: return scalar ? TR::BadILOp : TR::ILOpCode::createVectorOpCode(TR::vrol, vectorType);
          case VECTOR_OP_RROTATE: return scalar ? TR::BadILOp : TR::ILOpCode::createVectorOpCode(TR::vrol, vectorType);
          default:
-            return TR::BadILOp;
+            return reportMissingOpCode(comp, vectorAPIOpCode, objectType, opCodeType, withMask);
          }
       }
    else if ((opCodeType == Compare) && withMask)
@@ -3168,7 +3186,7 @@ TR::ILOpCodes TR_VectorAPIExpansion::ILOpcodeFromVectorAPIOpcode(TR::Compilation
          case BT_lt: return scalar ? TR::BadILOp : TR::ILOpCode::createVectorOpCode(TR::vmcmplt, vectorType, resultMaskType);
          case BT_gt: return scalar ? TR::BadILOp : TR::ILOpCode::createVectorOpCode(TR::vmcmpgt, vectorType, resultMaskType);
          default:
-            return TR::BadILOp;
+            return reportMissingOpCode(comp, vectorAPIOpCode, objectType, opCodeType, withMask);
          }
       }
    else if (opCodeType == Compare)
@@ -3185,7 +3203,7 @@ TR::ILOpCodes TR_VectorAPIExpansion::ILOpcodeFromVectorAPIOpcode(TR::Compilation
          case BT_lt: return scalar ? TR::BadILOp : TR::ILOpCode::createVectorOpCode(TR::vcmplt, vectorType, resultMaskType);
          case BT_gt: return scalar ? TR::BadILOp : TR::ILOpCode::createVectorOpCode(TR::vcmpgt, vectorType, resultMaskType);
          default:
-            return TR::BadILOp;
+            return reportMissingOpCode(comp, vectorAPIOpCode, objectType, opCodeType, withMask);
          }
       }
    else if ((opCodeType == Reduction) && withMask)
@@ -3203,7 +3221,7 @@ TR::ILOpCodes TR_VectorAPIExpansion::ILOpcodeFromVectorAPIOpcode(TR::Compilation
             // vreductionOrUnchecked
             // vreductionFirstNonZero
          default:
-            return TR::BadILOp;
+            return reportMissingOpCode(comp, vectorAPIOpCode, objectType, opCodeType, withMask);
          }
       }
    else if (opCodeType == Reduction)
@@ -3221,7 +3239,7 @@ TR::ILOpCodes TR_VectorAPIExpansion::ILOpcodeFromVectorAPIOpcode(TR::Compilation
             // vreductionOrUnchecked
             // vreductionFirstNonZero
          default:
-            return TR::BadILOp;
+            return reportMissingOpCode(comp, vectorAPIOpCode, objectType, opCodeType, withMask);
          }
       }
    else if (opCodeType == MaskReduction)
@@ -3233,7 +3251,7 @@ TR::ILOpCodes TR_VectorAPIExpansion::ILOpcodeFromVectorAPIOpcode(TR::Compilation
          case VECTOR_OP_MASK_LASTTRUE:  return scalar ? TR::BadILOp : TR::ILOpCode::createVectorOpCode(TR::mLastTrue, vectorType);
          case VECTOR_OP_MASK_TOLONG:    return scalar ? TR::BadILOp : TR::ILOpCode::createVectorOpCode(TR::mToLongBits, vectorType);
          default:
-            return TR::BadILOp;
+            return reportMissingOpCode(comp, vectorAPIOpCode, objectType, opCodeType, withMask);
          }
       }
    else if (withMask)
@@ -3268,7 +3286,7 @@ TR::ILOpCodes TR_VectorAPIExpansion::ILOpcodeFromVectorAPIOpcode(TR::Compilation
          case VECTOR_OP_EXPAND_BITS:   return scalar ? TR::BadILOp : TR::ILOpCode::createVectorOpCode(TR::vmexpandbits, vectorType);
 
          default:
-            return TR::BadILOp;
+            return reportMissingOpCode(comp, vectorAPIOpCode, objectType, opCodeType, withMask);
          // shiftLeftOpCode
          // shiftRightOpCode
          }
@@ -3329,12 +3347,12 @@ TR::ILOpCodes TR_VectorAPIExpansion::ILOpcodeFromVectorAPIOpcode(TR::Compilation
          */
 
          default:
-            return TR::BadILOp;
+            return reportMissingOpCode(comp, vectorAPIOpCode, objectType, opCodeType, withMask);
          // shiftLeftOpCode
          // shiftRightOpCode
          }
       }
-   return TR::BadILOp;
+   return reportMissingOpCode(comp, vectorAPIOpCode, objectType, opCodeType, withMask);
    }
 
 TR::Node *TR_VectorAPIExpansion::transformNary(TR_VectorAPIExpansion *opt, TR::TreeTop *treeTop, TR::Node *node,
@@ -3520,6 +3538,23 @@ TR_VectorAPIExpansion::vapiObjTypeNames[] =
    "Invalid"
    };
 
+const char*
+TR_VectorAPIExpansion::vapiOpCodeTypeNames [] =
+      {
+      "Compare",
+      "MaskReduction",
+      "Reduction",
+      "Test",
+      "Blend",
+      "BroadcastInt",
+      "Convert",
+      "Compress",
+      "Unary",
+      "Binary",
+      "Ternary"
+      };
+
+
 // high level methods are disabled because they require exception handling
 TR_VectorAPIExpansion::methodTableEntry
 TR_VectorAPIExpansion::methodTable[] =
@@ -3530,7 +3565,7 @@ TR_VectorAPIExpansion::methodTable[] =
 #else
    {storeIntrinsicHandler,                Unknown, 1, 2,  6, 1, -1, {Unknown, ElementType, NumLanes, Unknown, Unknown, Unknown, Vector}},        // jdk_internal_vm_vector_VectorSupport_store
 #endif
-   {binaryIntrinsicHandler,               Unknown,  3, 4,  5, 2,  7, {Unknown, Unknown, Unknown, ElementType, NumLanes, Vector, Vector, Mask}},   // jdk_internal_vm_vector_VectorSupport_binaryOp
+   {binaryIntrinsicHandler,               Unknown, 3, 4,  5, 2,  7, {Unknown, Unknown, Unknown, ElementType, NumLanes, Vector, Vector, Mask}},   // jdk_internal_vm_vector_VectorSupport_binaryOp
    {blendIntrinsicHandler,                Vector,  2, 3,  4, 3, -1, {Unknown, Unknown, ElementType, NumLanes, Vector, Vector, Mask, Unknown}}, // jdk_internal_vm_vector_VectorSupport_blend
    {broadcastIntIntrinsicHandler,         Vector,  3, 4,  5, 2,  7, {Unknown, Unknown, Unknown, ElementType, NumLanes, Vector, Unknown, Mask}},  //jdk_internal_vm_vector_VectorSupport_broadcastInt
    {compareIntrinsicHandler,              Mask,    3, 4,  5, 2,  7, {Unknown, Unknown, Unknown, ElementType, NumLanes, Vector, Vector, Mask}},   // jdk_internal_vm_vector_VectorSupport_compare

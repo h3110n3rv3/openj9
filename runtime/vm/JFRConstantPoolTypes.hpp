@@ -63,6 +63,11 @@ enum FrameType {
 	FrameTypeCount,
 };
 
+enum OOPModeType {
+	ZeroBased = 0,
+	OOPModeTypeCount,
+};
+
 enum ThreadState {
 	NEW = 0,
 	TERMINATED,
@@ -280,12 +285,34 @@ struct JVMInformationEntry {
 	I_64 pid;
 };
 
+struct SystemProcessEntry {
+	I_64 ticks;
+	UDATA pid;
+	char *commandLine;
+};
+
 struct CPUInformationEntry {
 	const char *cpu;
 	char *description;
 	U_32 sockets;
 	U_32 cores;
 	U_32 hwThreads;
+};
+
+struct GCHeapConfigurationEntry {
+	U_64 minSize;
+	U_64 maxSize;
+	U_64 initialSize;
+	BOOLEAN usesCompressedOops;
+	OOPModeType compressedOopsMode;
+	U_64 objectAlignment;
+	UDATA heapAddressBits;
+};
+
+struct YoungGenerationConfigurationEntry {
+	U_64 minSize;
+	U_64 maxSize;
+	U_64 newRatio;
 };
 
 struct VirtualizationInformationEntry {
@@ -296,11 +323,21 @@ struct OSInformationEntry {
 	char *osVersion;
 };
 
+struct NativeLibraryEntry {
+	I_64 ticks;
+	char *name;
+	UDATA addressLow;
+	UDATA addressHigh;
+	NativeLibraryEntry *next;
+};
+
 struct JFRConstantEvents {
 	JVMInformationEntry JVMInfoEntry;
 	CPUInformationEntry CPUInfoEntry;
 	VirtualizationInformationEntry VirtualizationInfoEntry;
 	OSInformationEntry OSInfoEntry;
+	GCHeapConfigurationEntry GCHeapConfigEntry;
+	YoungGenerationConfigurationEntry YoungGenConfigEntry;
 };
 
 class VM_JFRConstantPoolTypes {
@@ -361,6 +398,12 @@ private:
 	UDATA _threadContextSwitchRateCount;
 	J9Pool *_threadStatisticsTable;
 	UDATA _threadStatisticsCount;
+	J9Pool *_systemProcessTable;
+	UDATA _systemProcessCount;
+	UDATA _systemProcessStringSizeTotal;
+	J9Pool *_nativeLibrariesTable;
+	UDATA _nativeLibrariesCount;
+	UDATA _nativeLibraryPathSizeTotal;
 
 	/* Processing buffers */
 	StackFrame *_currentStackFrameBuffer;
@@ -380,6 +423,8 @@ private:
 	ClassloaderEntry *_firstClassloaderEntry;
 	PackageEntry *_previousPackageEntry;
 	PackageEntry *_firstPackageEntry;
+	NativeLibraryEntry *_firstNativeLibraryEntry;
+	NativeLibraryEntry *_previousNativeLibraryEntry;
 
 	/* default values */
 	ThreadGroupEntry _defaultThreadGroup;
@@ -698,6 +743,16 @@ public:
 		return _threadStatisticsTable;
 	}
 
+	J9Pool *getSystemProcessTable()
+	{
+		return _systemProcessTable;
+	}
+
+	J9Pool *getNativeLibraryTable()
+	{
+		return _nativeLibrariesTable;
+	}
+
 	UDATA getExecutionSampleCount()
 	{
 		return _executionSampleCount;
@@ -756,6 +811,26 @@ public:
 	UDATA getThreadStatisticsCount()
 	{
 		return _threadStatisticsCount;
+	}
+
+	UDATA getSystemProcessCount()
+	{
+		return _systemProcessCount;
+	}
+
+	UDATA getSystemProcessStringSizeTotal()
+	{
+		return _systemProcessStringSizeTotal;
+	}
+
+	UDATA getNativeLibraryCount()
+	{
+		return _nativeLibrariesCount;
+	}
+
+	UDATA getNativeLibraryPathSizeTotal()
+	{
+		return _nativeLibraryPathSizeTotal;
 	}
 
 	ClassloaderEntry *getClassloaderEntry()
@@ -878,7 +953,7 @@ public:
 
 	BuildResult getBuildResult() { return _buildResult; };
 
-	void loadEvents()
+	void loadEvents(bool dumpCalled)
 	{
 		J9JFRBufferWalkState walkstate = {0};
 		J9Pool *shallowEntries = NULL;
@@ -931,6 +1006,11 @@ public:
 
 		if (isResultNotOKay()) {
 			goto done;
+		}
+
+		if (dumpCalled) {
+			loadSystemProcesses(_currentThread);
+			loadNativeLibraries(_currentThread);
 		}
 
 		shallowEntries = pool_new(sizeof(ClassEntry**), 0, sizeof(U_64), 0, J9_GET_CALLSITE(), OMRMEM_CATEGORY_VM, POOL_FOR_PORT(privatePortLibrary));
@@ -989,6 +1069,8 @@ done:
 		initializeCPUInformationEvent(vm, currentThread, result);
 		initializeVirtualizationInformation(vm);
 		initializeOSInformation(vm, result);
+		initializeGCHeapConfigurationEvent(vm, result);
+		initializeYoungGenerationConfigurationEvent(vm);
 	}
 
 	/**
@@ -1209,6 +1291,135 @@ done:
 		}
 	}
 
+	/**
+	 * Initialize GCHeapConfigurationEntry
+	 *
+	 * @param vm[in] the J9JavaVM
+	 */
+	static void initializeGCHeapConfigurationEvent(J9JavaVM *vm, BuildResult *result)
+	{
+		J9MemoryManagerFunctions *mmFuncs = vm->memoryManagerFunctions;
+		GCHeapConfigurationEntry *gcConfiguration = &(getJFRConstantEvents(vm)->GCHeapConfigEntry);
+
+		gcConfiguration->minSize = mmFuncs->j9gc_get_initial_heap_size(vm);
+		gcConfiguration->maxSize = mmFuncs->j9gc_get_maximum_heap_size(vm);
+		gcConfiguration->initialSize = gcConfiguration->minSize;
+		uintptr_t value;
+		gcConfiguration->usesCompressedOops = mmFuncs->j9gc_modron_getConfigurationValueForKey(vm, j9gc_modron_configuration_compressObjectReferences, &value) ? value : 0;
+		gcConfiguration->compressedOopsMode = ZeroBased;
+		gcConfiguration->objectAlignment = vm->objectAlignmentInBytes;
+		gcConfiguration->heapAddressBits = J9JAVAVM_REFERENCE_SIZE(vm) * 8;
+	}
+
+	/**
+	 * Initialize YoungGenerationConfigurationEntry
+	 *
+	 * @param vm[in] the J9JavaVM
+	 */
+	static void initializeYoungGenerationConfigurationEvent(J9JavaVM *vm)
+	{
+		J9MemoryManagerFunctions *mmFuncs = vm->memoryManagerFunctions;
+		YoungGenerationConfigurationEntry *youngGenConfiguration = &(getJFRConstantEvents(vm)->YoungGenConfigEntry);
+
+		youngGenConfiguration->minSize = mmFuncs->j9gc_get_minimum_young_generation_size(vm);
+		youngGenConfiguration->maxSize = mmFuncs->j9gc_get_maximum_young_generation_size(vm);
+		if (0 != mmFuncs->j9gc_get_maximum_young_generation_size(vm)) {
+			youngGenConfiguration->newRatio = mmFuncs->j9gc_get_maximum_heap_size(vm)/mmFuncs->j9gc_get_maximum_young_generation_size(vm) - 1;
+		} else {
+			youngGenConfiguration->newRatio = 0;
+		}
+	}
+
+
+
+	static uintptr_t recordSystemProcessEvent(uintptr_t pid, const char *commandLine, void *userData)
+	{
+		VM_JFRConstantPoolTypes *constantPoolTypes = reinterpret_cast<VM_JFRConstantPoolTypes *>(userData);
+		PORT_ACCESS_FROM_JAVAVM(constantPoolTypes->_vm);
+		J9Pool *systemProcessTable = constantPoolTypes->getSystemProcessTable();
+		UDATA cmdLength = strlen(commandLine);
+		char *commandLineCopy = reinterpret_cast<char *>(j9mem_allocate_memory(cmdLength + 1, OMRMEM_CATEGORY_VM));
+		if (NULL == commandLineCopy) {
+			constantPoolTypes->_buildResult = OutOfMemory;
+			return ~(uintptr_t)0;
+		}
+		SystemProcessEntry *entry = reinterpret_cast<SystemProcessEntry *>(pool_newElement(systemProcessTable));
+		if (NULL == entry) {
+			j9mem_free_memory(commandLineCopy);
+			constantPoolTypes->_buildResult = OutOfMemory;
+			return ~(uintptr_t)0;
+		}
+		memcpy(commandLineCopy, commandLine, cmdLength + 1);
+		entry->ticks = j9time_nano_time();
+		entry->pid = pid;
+		entry->commandLine = commandLineCopy;
+		constantPoolTypes->_systemProcessStringSizeTotal += cmdLength;
+		constantPoolTypes->_systemProcessCount += 1;
+		return 0;
+	}
+
+	void loadSystemProcesses(J9VMThread *currentThread)
+	{
+		OMRPORT_ACCESS_FROM_J9VMTHREAD(currentThread);
+		omrsysinfo_get_processes(recordSystemProcessEvent, this);
+	}
+
+	static uintptr_t processNativeLibrariesCallback(const char *libraryName, void *lowAddress, void *highAddress, void *userData)
+	{
+		VM_JFRConstantPoolTypes *constantPoolTypes = reinterpret_cast<VM_JFRConstantPoolTypes *>(userData);
+		J9Pool *nativeLibrariesTable = constantPoolTypes->_nativeLibrariesTable;
+		NativeLibraryEntry *firstNativeLibraryEntry = constantPoolTypes->_firstNativeLibraryEntry;
+		NativeLibraryEntry *previousNativeLibraryEntry = constantPoolTypes->_previousNativeLibraryEntry;
+		NativeLibraryEntry *entry = firstNativeLibraryEntry;
+		PORT_ACCESS_FROM_JAVAVM(constantPoolTypes->_vm);
+		for (; NULL != entry; entry = entry->next) {
+			if (0 == strcmp(entry->name, libraryName)) {
+				if (entry->addressLow > (UDATA)lowAddress) {
+					entry->addressLow = (UDATA)lowAddress;
+				}
+				if (entry->addressHigh < (UDATA)highAddress) {
+					entry->addressHigh = (UDATA)highAddress;
+				}
+				return 0;
+			}
+		}
+		size_t libraryNameLength = strlen(libraryName);
+		char *libraryNameCopy = (char *)j9mem_allocate_memory(libraryNameLength + 1, OMRMEM_CATEGORY_VM);
+		if (NULL == libraryNameCopy) {
+			/* Allocation for library name failed. */
+			constantPoolTypes->_buildResult = OutOfMemory;
+			return 1;
+		}
+		NativeLibraryEntry *newEntry = reinterpret_cast<NativeLibraryEntry *>(pool_newElement(nativeLibrariesTable));
+		if (NULL == newEntry) {
+			/* Allocation failed. */
+			j9mem_free_memory(libraryNameCopy);
+			constantPoolTypes->_buildResult = OutOfMemory;
+			return 1;
+		}
+		memcpy(libraryNameCopy, libraryName, libraryNameLength + 1);
+		newEntry->ticks = j9time_nano_time();
+		newEntry->name = libraryNameCopy;
+		newEntry->addressLow = (UDATA)lowAddress;
+		newEntry->addressHigh = (UDATA)highAddress;
+		newEntry->next = NULL;
+		constantPoolTypes->_nativeLibrariesCount += 1;
+		constantPoolTypes->_nativeLibraryPathSizeTotal += libraryNameLength;
+		if (NULL != previousNativeLibraryEntry) {
+			previousNativeLibraryEntry->next = newEntry;
+		} else {
+			constantPoolTypes->_firstNativeLibraryEntry = newEntry;
+		}
+		constantPoolTypes->_previousNativeLibraryEntry = newEntry;
+		return 0;
+	}
+
+	void loadNativeLibraries(J9VMThread *currentThread)
+	{
+		OMRPORT_ACCESS_FROM_J9VMTHREAD(currentThread);
+		omrsl_get_libraries(processNativeLibrariesCallback, this);
+	}
+
 	VM_JFRConstantPoolTypes(J9VMThread *currentThread)
 		: _currentThread(currentThread)
 		, _vm(currentThread->javaVM)
@@ -1258,6 +1469,12 @@ done:
 		, _threadContextSwitchRateCount(0)
 		, _threadStatisticsTable(NULL)
 		, _threadStatisticsCount(0)
+		, _systemProcessTable(NULL)
+		, _systemProcessCount(0)
+		, _systemProcessStringSizeTotal(0)
+		, _nativeLibrariesTable(NULL)
+		, _nativeLibrariesCount(0)
+		, _nativeLibraryPathSizeTotal(0)
 		, _previousStackTraceEntry(NULL)
 		, _firstStackTraceEntry(NULL)
 		, _previousThreadEntry(NULL)
@@ -1274,6 +1491,8 @@ done:
 		, _firstClassloaderEntry(NULL)
 		, _previousPackageEntry(NULL)
 		, _firstPackageEntry(NULL)
+		, _firstNativeLibraryEntry(NULL)
+		, _previousNativeLibraryEntry(NULL)
 		, _requiredBufferSize(0)
 	{
 		_classTable = hashTableNew(OMRPORT_FROM_J9PORT(privatePortLibrary), J9_GET_CALLSITE(), 0, sizeof(ClassEntry), sizeof(ClassEntry *), 0, J9MEM_CATEGORY_CLASSES, jfrClassHashFn, jfrClassHashEqualFn, NULL, _vm);
@@ -1385,19 +1604,31 @@ done:
 		}
 
 		_classLoadingStatisticsTable = pool_new(sizeof(ClassLoadingStatisticsEntry), 0, sizeof(U_64), 0, J9_GET_CALLSITE(), OMRMEM_CATEGORY_VM, POOL_FOR_PORT(privatePortLibrary));
-		if (NULL == _classLoadingStatisticsTable ) {
+		if (NULL == _classLoadingStatisticsTable) {
 			_buildResult = OutOfMemory;
 			goto done;
 		}
 
 		_threadContextSwitchRateTable = pool_new(sizeof(ThreadContextSwitchRateEntry), 0, sizeof(U_64), 0, J9_GET_CALLSITE(), OMRMEM_CATEGORY_VM, POOL_FOR_PORT(privatePortLibrary));
-		if (NULL == _threadContextSwitchRateTable ) {
+		if (NULL == _threadContextSwitchRateTable) {
 			_buildResult = OutOfMemory;
 			goto done;
 		}
 
 		_threadStatisticsTable = pool_new(sizeof(ThreadStatisticsEntry), 0, sizeof(U_64), 0, J9_GET_CALLSITE(), OMRMEM_CATEGORY_VM, POOL_FOR_PORT(privatePortLibrary));
-		if (NULL == _threadStatisticsTable ) {
+		if (NULL == _threadStatisticsTable) {
+			_buildResult = OutOfMemory;
+			goto done;
+		}
+
+		_systemProcessTable = pool_new(sizeof(SystemProcessEntry), 0, sizeof(U_64), 0, J9_GET_CALLSITE(), OMRMEM_CATEGORY_VM, POOL_FOR_PORT(privatePortLibrary));
+		if (NULL == _systemProcessTable) {
+			_buildResult = OutOfMemory;
+			goto done;
+		}
+
+		_nativeLibrariesTable = pool_new(sizeof(NativeLibraryEntry), 0, sizeof(U_64), 0, J9_GET_CALLSITE(), OMRMEM_CATEGORY_VM, POOL_FOR_PORT(privatePortLibrary));
+		if (NULL == _nativeLibrariesTable) {
 			_buildResult = OutOfMemory;
 			goto done;
 		}
@@ -1495,6 +1726,8 @@ done:
 		pool_kill(_classLoadingStatisticsTable);
 		pool_kill(_threadContextSwitchRateTable);
 		pool_kill(_threadStatisticsTable);
+		pool_kill(_systemProcessTable);
+		pool_kill(_nativeLibrariesTable);
 		j9mem_free_memory(_globalStringTable);
 	}
 

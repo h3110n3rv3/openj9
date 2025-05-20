@@ -299,12 +299,18 @@ typedef void(*j9_tls_finalizer_t)(void *);
 #endif /* JAVA_SPEC_VERSION >= 19 */
 
 #if JAVA_SPEC_VERSION >= 24
-/* Constants from java.lang.VirutalThread.state that are used by the VM.
- * The full mapping is under jvmtiInternals.h <JVMTI_VTHREAD_STATE_*>.
+/* Constants from java.lang.VirtualThread.state that are used by the VM.
+ * The full mapping is under jvmtiInternal.h <JVMTI_VTHREAD_STATE_*>.
  */
+#define JAVA_LANG_VIRTUALTHREAD_RUNNING  2
 #define JAVA_LANG_VIRTUALTHREAD_BLOCKING 12
-#define JAVA_LANG_VIRTUALTHREAD_WAITING  13
+#define JAVA_LANG_VIRTUALTHREAD_BLOCKED  13
+#define JAVA_LANG_VIRTUALTHREAD_UNBLOCKED 14
+#define JAVA_LANG_VIRTUALTHREAD_WAITING  15
+#define JAVA_LANG_VIRTUALTHREAD_WAIT     16
 #define JAVA_LANG_VIRTUALTHREAD_TIMED_WAITING 17
+#define JAVA_LANG_VIRTUALTHREAD_TIMED_WAIT 18
+#define JAVA_LANG_VIRTUALTHREAD_SUSPENDED (1 << 8)
 #endif /* JAVA_SPEC_VERSION >= 24 */
 
 typedef enum {
@@ -439,7 +445,6 @@ typedef struct J9JFRMonitorWaited {
 
 typedef struct J9JFRThreadParked {
 	J9JFR_EVENT_WITH_STACKTRACE_FIELDS
-	I_64 time;
 	I_64 duration;
 	struct J9VMThread *thread;
 	struct J9Class *parkedClass;
@@ -697,6 +702,34 @@ typedef struct J9VTuneInterface {
 
 #define J9VTUNE_TRACE_LINE_NUMBERS  1
 
+/* A description of a call instruction within a JIT body that may land directly
+ * in the interpreter's invokeBasic() INL. From the JIT's perspective, the call
+ * is either a direct call to invokeBasic() (for which the actual call instruction
+ * goes via j2iTransition), or it's a call to JITHelpers.dispatchVirtual().
+ */
+typedef struct J9JITInvokeBasicCallSite {
+	U_32 jitReturnAddressOffset; /* from startPC */
+	U_8 numArgSlots;
+	void *j2iThunk; /* for JITHelpers.dispatchVirtual() */
+} J9JITInvokeBasicCallSite;
+
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4200)
+#endif /* defined(_MSC_VER) */
+
+/* Metadata describing the calls within a JIT body that may land directly in
+ * the interpreter's invokeBasic() INL.
+ */
+typedef struct J9JITInvokeBasicCallInfo {
+	U_32 numSites;
+	struct J9JITInvokeBasicCallSite sites[];
+} J9JITInvokeBasicCallInfo;
+
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif /* defined(_MSC_VER) */
+
 /* @ddr_namespace: map_to_type=J9JITExceptionTable */
 
 /* This structure is exposed by the compile_info field of CompiledMethodLoad() / JVMTI_EVENT_COMPILED_METHOD_LOAD.
@@ -735,6 +768,11 @@ typedef struct J9JITExceptionTable {
 	UDATA codeCacheAlloc;
 	void* gpuCode;
 	void* riData;
+	/* This is only needed for J9VM_OPT_OPENJDK_METHODHANDLE, but include this
+	 * field unconditionally so that the size and layout of J9JITExceptionTable
+	 * won't depend on configure options.
+	 */
+	struct J9JITInvokeBasicCallInfo* invokeBasicCallInfo;
 } J9JITExceptionTable;
 
 #define JIT_METADATA_FLAGS_USED_FOR_SIZE 0x1
@@ -1727,9 +1765,11 @@ typedef struct J9ObjectMonitor {
 	j9objectmonitor_t alternateLockword;
 	U_32 hash;
 #if JAVA_SPEC_VERSION >= 24
-	U_32 virtualThreadWaitCount;
+	volatile U_32 virtualThreadWaitCount;
+	volatile U_32 platformThreadWaitCount;
 	struct J9VMContinuation* ownerContinuation;
 	struct J9VMContinuation* waitingContinuations;
+	struct J9ObjectMonitor* next;
 #endif /* JAVA_SPEC_VERSION >= 24 */
 } J9ObjectMonitor;
 
@@ -4138,6 +4178,7 @@ typedef struct J9JITConfig {
 	void *old_slow_jitThrowInstantiationException;
 	void *old_slow_jitThrowNullPointerException;
 	void *old_slow_jitThrowWrongMethodTypeException;
+	void *old_slow_jitThrowIdentityException;
 	void *old_fast_jitTypeCheckArrayStoreWithNullCheck;
 	void *old_slow_jitTypeCheckArrayStoreWithNullCheck;
 	void *old_fast_jitTypeCheckArrayStore;
@@ -4260,6 +4301,9 @@ typedef struct J9JITConfig {
 	UDATA  ( *getByteCodeIndexFromStackMap)(struct J9JITExceptionTable *metaData, void *stackMap) ;
 	U_32  ( *getJitRegisterMap)(struct J9JITExceptionTable *metadata, void * stackMap) ;
 	UDATA  ( *getCurrentByteCodeIndexAndIsSameReceiver)(struct J9JITExceptionTable * methodMetaData, void * stackMap, void * currentInlinedCallSite, UDATA * isSameReceiver) ;
+#if defined(J9VM_OPT_OPENJDK_METHODHANDLE)
+	struct J9JITInvokeBasicCallSite* ( *jitGetInvokeBasicCallSiteFromPC)(struct J9VMThread *vmThread, UDATA jitPC);
+#endif /* defined(J9VM_OPT_OPENJDK_METHODHANDLE) */
 	void  ( *jitCodeBreakpointAdded)(struct J9VMThread * currentThread, J9Method * method) ;
 	void  ( *jitCodeBreakpointRemoved)(struct J9VMThread * currentThread, J9Method * method) ;
 	void  ( *jitDataBreakpointAdded)(struct J9VMThread * currentThread) ;
@@ -4360,6 +4404,9 @@ typedef struct J9JITConfig {
 	UDATA osrStackFrameMaximumSize;
 	void* jitFillOSRBufferReturn;
 	IDATA  ( *launchGPU)(struct J9VMThread *vmThread, jobject invokeObject, J9Method *method, int deviceId, I_32 gridDimX, I_32 gridDimY, I_32 gridDimZ, I_32 blockDimX, I_32 blockDimY, I_32 blockDimZ, void **args) ;
+#if JAVA_SPEC_VERSION >= 24
+	void* jitExitInterpreter0RestoreAll;
+#endif /* JAVA_SPEC_VERSION >= 24 */
 	void* jitExitInterpreter0;
 	void* jitExitInterpreter1;
 	void* jitExitInterpreterF;
@@ -4433,6 +4480,7 @@ typedef struct J9DelayedLockingOpertionsRecord {
 #define J9VM_CRAC_IS_CHECKPOINT_ENABLED 0x80
 #define J9VM_CRIU_SUPPORT_DEBUG_ON_RESTORE 0x100
 #define J9VM_CRIU_TRANSITION_TO_DEBUG_INTERPRETER 0x200
+#define J9VM_CRIU_ENABLE_TIME_COMPENSATION 0x400
 
 /* matches maximum count defined by JDWP in threadControl.c */
 #define J9VM_CRIU_MAX_DEBUG_THREADS_STORED 10
@@ -4850,6 +4898,7 @@ typedef struct J9MemoryManagerFunctions {
 	void  ( *j9mm_get_guaranteed_nursery_range)(struct J9JavaVM* javaVM, void** start, void** end) ;
 	UDATA  ( *j9gc_arraylet_getLeafSize)(struct J9JavaVM* javaVM) ;
 	UDATA  ( *j9gc_arraylet_getLeafLogSize)(struct J9JavaVM* javaVM) ;
+	void  ( *j9gc_get_offheap_data)(struct J9JavaVM *javaVM, void **offheapControlStructure, void **base, void **top, UDATA *usage);
 	void  ( *j9gc_set_allocation_sampling_interval)(struct J9JavaVM *vm, UDATA samplingInterval);
 	void  ( *j9gc_set_allocation_threshold)(struct J9VMThread *vmThread, UDATA low, UDATA high) ;
 	void  ( *j9gc_objaccess_recentlyAllocatedObject)(struct J9VMThread *vmThread, J9Object *dstObject) ;
@@ -5284,6 +5333,7 @@ typedef struct J9InternalVMFunctions {
 	BOOLEAN (*jvmRestoreHooks)(struct J9VMThread *currentThread);
 	BOOLEAN (*isCRaCorCRIUSupportEnabled)(struct J9JavaVM *vm);
 	BOOLEAN (*isCRIUSupportEnabled)(struct J9VMThread *currentThread);
+	BOOLEAN (*isTimeCompensationEnabled)(struct J9VMThread *currentThread);
 	BOOLEAN (*enableCRIUSecProvider)(struct J9VMThread *currentThread);
 	BOOLEAN (*isCheckpointAllowed)(struct J9JavaVM *vm);
 	BOOLEAN (*isNonPortableRestoreMode)(struct J9VMThread *currentThread);
@@ -5327,6 +5377,8 @@ typedef struct J9InternalVMFunctions {
 	UDATA (*walkAllStackFrames)(struct J9VMThread *currentThread, J9StackWalkState *walkState);
 	BOOLEAN (*acquireVThreadInspector)(struct J9VMThread *currentThread, jobject thread, BOOLEAN spin);
 	void (*releaseVThreadInspector)(struct J9VMThread *currentThread, jobject thread);
+	void (*enterVThreadTransitionCritical)(struct J9VMThread *currentThread, jobject thread);
+	void (*exitVThreadTransitionCritical)(struct J9VMThread *currentThread, jobject thread);
 #endif /* JAVA_SPEC_VERSION >= 19 */
 	UDATA (*checkArgsConsumed)(struct J9JavaVM * vm, struct J9PortLibrary* portLibrary, struct J9VMInitArgs* j9vm_args);
 #if defined(J9VM_ZOS_3164_INTEROPERABILITY) && (JAVA_SPEC_VERSION >= 17)
@@ -5351,7 +5403,10 @@ typedef struct J9InternalVMFunctions {
 #if JAVA_SPEC_VERSION >= 24
 	struct J9ObjectMonitor * (*monitorTablePeek)(struct J9JavaVM *vm, j9object_t object);
 	jobject (*takeVirtualThreadListToUnblock)(struct J9VMThread *currentThread);
+	UDATA (*preparePinnedVirtualThreadForUnmount)(struct J9VMThread *currentThread, j9object_t syncObj, BOOLEAN isObjectWait);
+	J9ObjectMonitor * (*detachMonitorInfo)(struct J9VMThread *currentThread, j9object_t lockObject);
 #endif /* JAVA_SPEC_VERSION >= 24 */
+	jobjectArray (*getSystemPropertyList)(JNIEnv *env);
 } J9InternalVMFunctions;
 
 /* Jazz 99339: define a new structure to replace JavaVM so as to pass J9NativeLibrary to JVMTIEnv  */
@@ -5435,6 +5490,10 @@ typedef uintptr_t ContinuationState;
 #define J9VM_CONTINUATION_RETURN_FROM_MONITOR_ENTER 0
 #define J9VM_CONTINUATION_RETURN_FROM_OBJECT_WAIT   2
 #define J9VM_CONTINUATION_RETURN_FROM_SYNC_METHOD   3
+#define J9VM_CONTINUATION_RETURN_FROM_JIT_MONITOR_ENTER 4
+#define J9VM_CONTINUATION_RETURN_FROM_SYNC_METHOD_JNI 5
+
+#define J9VM_CONTINUATION_RUNTIMEFLAG_JVMTI_CONTENDED_MONITOR_ENTER_RECORDED 0x1
 #endif /* JAVA_SPEC_VERSION >= 24 */
 
 typedef struct J9VMContinuation {
@@ -5461,9 +5520,21 @@ typedef struct J9VMContinuation {
 	struct J9MonitorEnterRecord* jniMonitorEnterRecords;
 	j9object_t vthread;
 	struct J9VMContinuation* nextWaitingContinuation;
+	struct J9ObjectMonitor* objectWaitMonitor;
+	struct J9ObjectMonitor* enteredMonitors;
+	UDATA runtimeFlags;
+	I_64 startTicks;
+	struct J9VMThread* previousOwner;
 #endif /* JAVA_SPEC_VERSION >= 24 */
 } J9VMContinuation;
 #endif /* JAVA_SPEC_VERSION >= 19 */
+
+#if JAVA_SPEC_VERSION >= 24
+#define J9_OBJECT_MONITOR_OWNER_DETACHED 0x1
+#define IS_J9_OBJECT_MONITOR_OWNER_DETACHED(owner) (J9_OBJECT_MONITOR_OWNER_DETACHED == (UDATA)(owner))
+#else /* JAVA_SPEC_VERSION >= 24 */
+#define IS_J9_OBJECT_MONITOR_OWNER_DETACHED(owner) FALSE
+#endif /* JAVA_SPEC_VERSION >= 24 */
 
 /* @ddr_namespace: map_to_type=J9VMThread */
 
