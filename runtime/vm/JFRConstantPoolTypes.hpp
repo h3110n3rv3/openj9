@@ -275,6 +275,13 @@ struct ThreadStatisticsEntry {
 	U_64 peakThreadCount;
 };
 
+struct SystemGCEntry {
+	I_64 ticks;
+	I_64 duration;
+	U_32 eventThreadIndex;
+	U_32 stackTraceIndex;
+};
+
 struct JVMInformationEntry {
 	const char *jvmName;
 	const char *jvmVersion;
@@ -341,9 +348,7 @@ struct JFRConstantEvents {
 };
 
 class VM_JFRConstantPoolTypes {
-		/*
-	 * Data members
-	 */
+	/* Data members */
 private:
 	J9VMThread *_currentThread;
 	J9JavaVM *_vm;
@@ -404,6 +409,8 @@ private:
 	J9Pool *_nativeLibrariesTable;
 	UDATA _nativeLibrariesCount;
 	UDATA _nativeLibraryPathSizeTotal;
+	J9Pool *_systemGCTable;
+	UDATA _systemGCCount;
 
 	/* Processing buffers */
 	StackFrame *_currentStackFrameBuffer;
@@ -447,9 +454,7 @@ protected:
 public:
 	static constexpr int STRING_BUFFER_LENGTH = 128;
 
-	/*
-	 * Function members
-	 */
+	/* Function members */
 private:
 	static UDATA classloaderNameHashFn(void *key, void *userData);
 
@@ -540,7 +545,7 @@ private:
 	U_32 addClassLoaderEntry(J9ClassLoader *classLoader);
 
 	/*
-	 * Adds class to the table but doesnt fill out fields to avoid
+	 * Adds class to the table but doesn't fill out fields to avoid
 	 * circularities.
 	 */
 	U_32 getShallowClassEntry(J9Class *clazz);
@@ -571,7 +576,7 @@ private:
 
 	static UDATA stackTraceCallback(J9VMThread *vmThread, void *userData, UDATA bytecodeOffset, J9ROMClass *romClass, J9ROMMethod *romMethod, J9UTF8 *fileName, UDATA lineNumber, J9ClassLoader *classLoader, J9Class *ramClass, UDATA frameType)
 	{
-		VM_JFRConstantPoolTypes *cp = (VM_JFRConstantPoolTypes*) userData;
+		VM_JFRConstantPoolTypes *cp = (VM_JFRConstantPoolTypes *)userData;
 		StackFrame *frame = &cp->_currentStackFrameBuffer[cp->_currentFrameCount];
 
 		if ((NULL == ramClass) || (NULL == romMethod)) {
@@ -602,7 +607,7 @@ skipFrame:
 	void mergeStringTables() {
 		_buildResult = OK;
 
-		_globalStringTable = (void**)j9mem_allocate_memory(sizeof(void*) * (_stringUTF8Count + _packageCount), J9MEM_CATEGORY_CLASSES);
+		_globalStringTable = (void **)j9mem_allocate_memory(sizeof(void *) * (_stringUTF8Count + _packageCount), J9MEM_CATEGORY_CLASSES);
 		if (NULL == _globalStringTable) {
 			_buildResult = OutOfMemory;
 			goto done;
@@ -634,7 +639,7 @@ done:
 		J9VMSystemProperty *jvmInfoProperty = NULL;
 		const char *value = "";
 		UDATA getPropertyResult = vm->internalVMFunctions->getSystemProperty(vm, propName, &jvmInfoProperty);
-		if (J9SYSPROP_ERROR_NOT_FOUND != getPropertyResult) {
+		if (J9SYSPROP_ERROR_NONE == getPropertyResult) {
 			value = jvmInfoProperty->value;
 		}
 		return value;
@@ -667,11 +672,11 @@ public:
 
 	void addThreadSleepEntry(J9JFRThreadSlept *threadSleepData);
 
-	void addMonitorWaitEntry(J9JFRMonitorWaited* threadWaitData);
+	void addMonitorWaitEntry(J9JFRMonitorWaited *threadWaitData);
 
 	void addMonitorEnterEntry(J9JFRMonitorEntered *monitorEnterData);
 
-	void addThreadParkEntry(J9JFRThreadParked* threadParkData);
+	void addThreadParkEntry(J9JFRThreadParked *threadParkData);
 
 	void addCPULoadEntry(J9JFRCPULoad *cpuLoadData);
 
@@ -682,6 +687,8 @@ public:
 	void addThreadContextSwitchRateEntry(J9JFRThreadContextSwitchRate *threadContextSwitchRateData);
 
 	void addThreadStatisticsEntry(J9JFRThreadStatistics *threadStatisticsData);
+
+	void addSystemGCEntry(J9JFRSystemGC *systemGCData);
 
 	J9Pool *getExecutionSampleTable()
 	{
@@ -756,6 +763,16 @@ public:
 	UDATA getExecutionSampleCount()
 	{
 		return _executionSampleCount;
+	}
+
+	J9Pool *getSystemGCTable()
+	{
+		return _systemGCTable;
+	}
+
+	UDATA getsystemGCCount()
+	{
+		return _systemGCCount;
 	}
 
 	UDATA getThreadStartCount()
@@ -948,10 +965,12 @@ public:
 		return (JFRConstantEvents *)vm->jfrState.constantEvents;
 	}
 
-
 	void printTables();
 
-	BuildResult getBuildResult() { return _buildResult; };
+	BuildResult getBuildResult()
+	{
+		return _buildResult;
+	}
 
 	void loadEvents(bool dumpCalled)
 	{
@@ -962,25 +981,25 @@ public:
 		while (NULL != event) {
 			switch (event->eventType) {
 			case J9JFR_EVENT_TYPE_EXECUTION_SAMPLE:
-				addExecutionSampleEntry((J9JFRExecutionSample*) event);
+				addExecutionSampleEntry((J9JFRExecutionSample *)event);
 				break;
 			case J9JFR_EVENT_TYPE_THREAD_START:
-				addThreadStartEntry((J9JFRThreadStart*) event);
+				addThreadStartEntry((J9JFRThreadStart *)event);
 				break;
 			case J9JFR_EVENT_TYPE_THREAD_END:
-				addThreadEndEntry((J9JFREvent*) event);
+				addThreadEndEntry((J9JFREvent *)event);
 				break;
 			case J9JFR_EVENT_TYPE_THREAD_SLEEP:
-				addThreadSleepEntry((J9JFRThreadSlept*) event);
+				addThreadSleepEntry((J9JFRThreadSlept *)event);
 				break;
 			case J9JFR_EVENT_TYPE_OBJECT_WAIT:
-				addMonitorWaitEntry((J9JFRMonitorWaited*) event);
+				addMonitorWaitEntry((J9JFRMonitorWaited *)event);
 				break;
 			case J9JFR_EVENT_TYPE_MONITOR_ENTER:
-				addMonitorEnterEntry((J9JFRMonitorEntered *) event);
+				addMonitorEnterEntry((J9JFRMonitorEntered *)event);
 				break;
 			case J9JFR_EVENT_TYPE_THREAD_PARK:
-				addThreadParkEntry((J9JFRThreadParked*) event);
+				addThreadParkEntry((J9JFRThreadParked *)event);
 				break;
 			case J9JFR_EVENT_TYPE_CPU_LOAD:
 				addCPULoadEntry((J9JFRCPULoad *)event);
@@ -996,6 +1015,9 @@ public:
 				break;
 			case J9JFR_EVENT_TYPE_THREAD_STATISTICS:
 				addThreadStatisticsEntry((J9JFRThreadStatistics *)event);
+				break;
+			case J9JFR_EVENT_TYPE_SYSTEM_GC:
+				addSystemGCEntry((J9JFRSystemGC *)event);
 				break;
 			default:
 				Assert_VM_unreachable();
@@ -1013,7 +1035,7 @@ public:
 			loadNativeLibraries(_currentThread);
 		}
 
-		shallowEntries = pool_new(sizeof(ClassEntry**), 0, sizeof(U_64), 0, J9_GET_CALLSITE(), OMRMEM_CATEGORY_VM, POOL_FOR_PORT(privatePortLibrary));
+		shallowEntries = pool_new(sizeof(ClassEntry **), 0, sizeof(U_64), 0, J9_GET_CALLSITE(), OMRMEM_CATEGORY_VM, POOL_FOR_PORT(privatePortLibrary));
 		if (NULL == shallowEntries) {
 			_buildResult = OutOfMemory;
 			goto done;
@@ -1039,16 +1061,16 @@ done:
 			goto done;
 		}
 
-		expandedStackTraceCount = iterateStackTraceImpl(_currentThread, (j9object_t*)walkStateCache, NULL, NULL, FALSE, FALSE, numberOfFrames, FALSE);
+		expandedStackTraceCount = iterateStackTraceImpl(_currentThread, (j9object_t *)walkStateCache, NULL, NULL, FALSE, FALSE, numberOfFrames, FALSE);
 
-		_currentStackFrameBuffer = (StackFrame*) j9mem_allocate_memory(sizeof(StackFrame) * expandedStackTraceCount, J9MEM_CATEGORY_CLASSES);
+		_currentStackFrameBuffer = (StackFrame *)j9mem_allocate_memory(sizeof(StackFrame) * expandedStackTraceCount, J9MEM_CATEGORY_CLASSES);
 		_currentFrameCount = 0;
 		if (NULL == _currentStackFrameBuffer) {
 			_buildResult = OutOfMemory;
 			goto done;
 		}
 
-		iterateStackTraceImpl(_currentThread, (j9object_t*)walkStateCache, &stackTraceCallback, this, FALSE, FALSE, numberOfFrames, FALSE);
+		iterateStackTraceImpl(_currentThread, (j9object_t *)walkStateCache, &stackTraceCallback, this, FALSE, FALSE, numberOfFrames, FALSE);
 
 		index = addStackTraceEntry(walkThread, j9time_nano_time(), _currentFrameCount);
 		_stackFrameCount += (U_32)expandedStackTraceCount;
@@ -1069,7 +1091,7 @@ done:
 		initializeCPUInformationEvent(vm, currentThread, result);
 		initializeVirtualizationInformation(vm);
 		initializeOSInformation(vm, result);
-		initializeGCHeapConfigurationEvent(vm, result);
+		initializeGCHeapConfigurationEvent(vm);
 		initializeYoungGenerationConfigurationEvent(vm);
 	}
 
@@ -1116,7 +1138,7 @@ done:
 			vmArgsLen += strlen(vmArgs->options[i].optionString);
 		}
 
-		jvmInformation->jvmArguments = (char *)j9mem_allocate_memory(sizeof(char) * vmArgsLen, OMRMEM_CATEGORY_VM);
+		jvmInformation->jvmArguments = (char *)j9mem_allocate_memory(vmArgsLen, OMRMEM_CATEGORY_VM);
 		char *cursor = jvmInformation->jvmArguments;
 
 		if (NULL != cursor) {
@@ -1125,7 +1147,7 @@ done:
 				memcpy(cursor, vmArgs->options[i].optionString, len);
 				cursor += len;
 
-				if (i == vmArgs->nOptions - 1) {
+				if (i == (vmArgs->nOptions - 1)) {
 					*cursor = '\0';
 				} else {
 					*cursor = ' ';
@@ -1177,7 +1199,7 @@ done:
 		char buffer[512];
 		omrsysinfo_get_processor_feature_string(&desc, buffer, sizeof(buffer));
 		UDATA len = strlen(buffer) + 1;
-		cpuInformation->description = (char *)j9mem_allocate_memory(sizeof(char) * len, OMRMEM_CATEGORY_VM);
+		cpuInformation->description = (char *)j9mem_allocate_memory(len, OMRMEM_CATEGORY_VM);
 		if (NULL != cpuInformation->description) {
 			memcpy(cpuInformation->description, buffer, len);
 		} else {
@@ -1221,7 +1243,7 @@ done:
 		intptr_t rc = j9hypervisor_hypervisor_present();
 		J9HypervisorVendorDetails vendorDetails = {0};
 
-		switch(rc) {
+		switch (rc) {
 		case J9HYPERVISOR_NOT_PRESENT:
 			virtualizationInfo->name = "No virtualization detected";
 			break;
@@ -1235,7 +1257,7 @@ done:
 		default:
 			virtualizationInfo->name = "Error getting virtualization information";
 			break;
-		};
+		}
 	}
 
 	/**
@@ -1254,7 +1276,7 @@ done:
 
 		UDATA len = 3 + strlen(osName) + strlen(osVersion) + strlen(osArch);
 
-		getJFRConstantEvents(vm)->OSInfoEntry.osVersion = (char *)j9mem_allocate_memory(sizeof(char) * len, OMRMEM_CATEGORY_VM);
+		getJFRConstantEvents(vm)->OSInfoEntry.osVersion = (char *)j9mem_allocate_memory(len, OMRMEM_CATEGORY_VM);
 		char *buffer = getJFRConstantEvents(vm)->OSInfoEntry.osVersion;
 		if (NULL == buffer) {
 			*result = OutOfMemory;
@@ -1296,7 +1318,7 @@ done:
 	 *
 	 * @param vm[in] the J9JavaVM
 	 */
-	static void initializeGCHeapConfigurationEvent(J9JavaVM *vm, BuildResult *result)
+	static void initializeGCHeapConfigurationEvent(J9JavaVM *vm)
 	{
 		J9MemoryManagerFunctions *mmFuncs = vm->memoryManagerFunctions;
 		GCHeapConfigurationEntry *gcConfiguration = &(getJFRConstantEvents(vm)->GCHeapConfigEntry);
@@ -1304,7 +1326,7 @@ done:
 		gcConfiguration->minSize = mmFuncs->j9gc_get_initial_heap_size(vm);
 		gcConfiguration->maxSize = mmFuncs->j9gc_get_maximum_heap_size(vm);
 		gcConfiguration->initialSize = gcConfiguration->minSize;
-		uintptr_t value;
+		uintptr_t value = 0;
 		gcConfiguration->usesCompressedOops = mmFuncs->j9gc_modron_getConfigurationValueForKey(vm, j9gc_modron_configuration_compressObjectReferences, &value) ? value : 0;
 		gcConfiguration->compressedOopsMode = ZeroBased;
 		gcConfiguration->objectAlignment = vm->objectAlignmentInBytes;
@@ -1323,14 +1345,12 @@ done:
 
 		youngGenConfiguration->minSize = mmFuncs->j9gc_get_minimum_young_generation_size(vm);
 		youngGenConfiguration->maxSize = mmFuncs->j9gc_get_maximum_young_generation_size(vm);
-		if (0 != mmFuncs->j9gc_get_maximum_young_generation_size(vm)) {
-			youngGenConfiguration->newRatio = mmFuncs->j9gc_get_maximum_heap_size(vm)/mmFuncs->j9gc_get_maximum_young_generation_size(vm) - 1;
+		if (0 != youngGenConfiguration->maxSize) {
+			youngGenConfiguration->newRatio = (mmFuncs->j9gc_get_maximum_heap_size(vm) / youngGenConfiguration->maxSize) - 1;
 		} else {
 			youngGenConfiguration->newRatio = 0;
 		}
 	}
-
-
 
 	static uintptr_t recordSystemProcessEvent(uintptr_t pid, const char *commandLine, void *userData)
 	{
@@ -1475,6 +1495,8 @@ done:
 		, _nativeLibrariesTable(NULL)
 		, _nativeLibrariesCount(0)
 		, _nativeLibraryPathSizeTotal(0)
+		, _systemGCTable(NULL)
+		, _systemGCCount(0)
 		, _previousStackTraceEntry(NULL)
 		, _firstStackTraceEntry(NULL)
 		, _previousThreadEntry(NULL)
@@ -1507,25 +1529,25 @@ done:
 			goto done;
 		}
 
-		_classLoaderTable = hashTableNew(OMRPORT_FROM_J9PORT(privatePortLibrary), J9_GET_CALLSITE(), 0, sizeof(ClassloaderEntry), sizeof(J9ClassLoader*), 0, J9MEM_CATEGORY_CLASSES, classloaderNameHashFn, classloaderNameHashEqualFn, NULL, _vm);
+		_classLoaderTable = hashTableNew(OMRPORT_FROM_J9PORT(privatePortLibrary), J9_GET_CALLSITE(), 0, sizeof(ClassloaderEntry), sizeof(J9ClassLoader *), 0, J9MEM_CATEGORY_CLASSES, classloaderNameHashFn, classloaderNameHashEqualFn, NULL, _vm);
 		if (NULL == _classLoaderTable) {
 			_buildResult = OutOfMemory;
 			goto done;
 		}
 
-		_methodTable = hashTableNew(OMRPORT_FROM_J9PORT(privatePortLibrary), J9_GET_CALLSITE(), 0, sizeof(MethodEntry), sizeof(J9ROMMethod*), 0, J9MEM_CATEGORY_CLASSES, methodNameHashFn, methodNameHashEqualFn, NULL, _vm);
+		_methodTable = hashTableNew(OMRPORT_FROM_J9PORT(privatePortLibrary), J9_GET_CALLSITE(), 0, sizeof(MethodEntry), sizeof(J9ROMMethod *), 0, J9MEM_CATEGORY_CLASSES, methodNameHashFn, methodNameHashEqualFn, NULL, _vm);
 		if (NULL == _methodTable) {
 			_buildResult = OutOfMemory;
 			goto done;
 		}
 
-		_stringUTF8Table = hashTableNew(OMRPORT_FROM_J9PORT(privatePortLibrary), J9_GET_CALLSITE(), 0, sizeof(StringUTF8Entry), sizeof(StringUTF8Entry*), 0, J9MEM_CATEGORY_CLASSES, jfrStringUTF8HashFn, jfrStringUTF8HashEqualFn, NULL, _vm);
+		_stringUTF8Table = hashTableNew(OMRPORT_FROM_J9PORT(privatePortLibrary), J9_GET_CALLSITE(), 0, sizeof(StringUTF8Entry), sizeof(StringUTF8Entry *), 0, J9MEM_CATEGORY_CLASSES, jfrStringUTF8HashFn, jfrStringUTF8HashEqualFn, NULL, _vm);
 		if (NULL == _stringUTF8Table) {
 			_buildResult = OutOfMemory;
 			goto done;
 		}
 
-		_moduleTable = hashTableNew(OMRPORT_FROM_J9PORT(privatePortLibrary), J9_GET_CALLSITE(), 0, sizeof(ModuleEntry), sizeof(ModuleEntry*), 0, J9MEM_CATEGORY_CLASSES, jfrModuleHashFn, jfrModuleHashEqualFn, NULL, _vm);
+		_moduleTable = hashTableNew(OMRPORT_FROM_J9PORT(privatePortLibrary), J9_GET_CALLSITE(), 0, sizeof(ModuleEntry), sizeof(ModuleEntry *), 0, J9MEM_CATEGORY_CLASSES, jfrModuleHashFn, jfrModuleHashEqualFn, NULL, _vm);
 		if (NULL == _moduleTable) {
 			_buildResult = OutOfMemory;
 			goto done;
@@ -1633,25 +1655,31 @@ done:
 			goto done;
 		}
 
+		_systemGCTable = pool_new(sizeof(SystemGCEntry), 0, sizeof(U_64), 0, J9_GET_CALLSITE(), OMRMEM_CATEGORY_VM, POOL_FOR_PORT(privatePortLibrary));
+		if (NULL == _systemGCTable) {
+			_buildResult = OutOfMemory;
+			goto done;
+		}
+
 		/* Add reserved index for default entries. For strings zero is the empty or NUll string.
 		 * For package zero is the deafult package, for Module zero is the unnamed module. ThreadGroup
 		 * zero is NULL threadGroup.
 		 */
 		_stringUTF8Count += 1;
 		memset(&_defaultStringUTF8Entry, 0, sizeof(_defaultStringUTF8Entry));
-		_defaultStringUTF8Entry.string = (J9UTF8*)&nullString;
+		_defaultStringUTF8Entry.string = (J9UTF8 *)&nullString;
 
 		_stringUTF8Count += 1;
 		memset(&_unknownClassStringUTF8Entry , 0, sizeof(_unknownClassStringUTF8Entry));
-		_unknownClassStringUTF8Entry.string = (J9UTF8*)&unknownClass;
+		_unknownClassStringUTF8Entry.string = (J9UTF8 *)&unknownClass;
 
 		_stringUTF8Count += 1;
 		memset(&_nativeMethodStringUTF8Entry, 0, sizeof(_nativeMethodStringUTF8Entry));
-		_nativeMethodStringUTF8Entry.string = (J9UTF8*)&nativeMethod;
+		_nativeMethodStringUTF8Entry.string = (J9UTF8 *)&nativeMethod;
 
 		_stringUTF8Count += 1;
 		memset(&_nativeMethodSignatureStringUTF8Entry, 0, sizeof(_nativeMethodSignatureStringUTF8Entry));
-		_nativeMethodSignatureStringUTF8Entry.string = (J9UTF8*)&nativeMethodSignature;
+		_nativeMethodSignatureStringUTF8Entry.string = (J9UTF8 *)&nativeMethodSignature;
 
 		_moduleCount += 1;
 		memset(&_defaultModuleEntry, 0, sizeof(_defaultModuleEntry));
@@ -1661,8 +1689,8 @@ done:
 		_packageCount += 1;
 		memset(&_defaultPackageEntry, 0, sizeof(_defaultPackageEntry));
 		_defaultPackageEntry.exported = TRUE;
-		_defaultPackageEntry.packageName = J9UTF8_DATA((J9UTF8*) &defaultPackage);
-		_defaultPackageEntry.packageNameLength = J9UTF8_LENGTH((J9UTF8*) &defaultPackage);
+		_defaultPackageEntry.packageName = J9UTF8_DATA((J9UTF8 *)&defaultPackage);
+		_defaultPackageEntry.packageNameLength = J9UTF8_LENGTH((J9UTF8 *)&defaultPackage);
 		_firstPackageEntry = &_defaultPackageEntry;
 		_previousPackageEntry = _firstPackageEntry;
 
@@ -1728,6 +1756,7 @@ done:
 		pool_kill(_threadStatisticsTable);
 		pool_kill(_systemProcessTable);
 		pool_kill(_nativeLibrariesTable);
+		pool_kill(_systemGCTable);
 		j9mem_free_memory(_globalStringTable);
 	}
 
