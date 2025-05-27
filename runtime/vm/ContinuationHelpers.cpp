@@ -781,6 +781,7 @@ detachMonitorInfo(J9VMThread *currentThread, j9object_t lockObject)
 
 	J9ThreadAbstractMonitor *monitor = (J9ThreadAbstractMonitor *)objectMonitor->monitor;
 	monitor->owner = (J9Thread *)J9_OBJECT_MONITOR_OWNER_DETACHED;
+	Assert_VM_notNull(currentThread->currentContinuation);
 	objectMonitor->ownerContinuation = currentThread->currentContinuation;
 
 	return objectMonitor;
@@ -994,7 +995,9 @@ restart:
 										| ((count - 1) << OBJECT_HEADER_LOCK_V2_RECURSION_OFFSET)
 										| OBJECT_HEADER_LOCK_FLC;
 						}
+						Assert_VM_true(newLockword != OBJECT_HEADER_LOCK_FLC);
 						j9objectmonitor_t const oldValue = lock;
+						VM_AtomicSupport::writeBarrier();
 						lock = VM_ObjectMonitor::compareAndSwapLockword(currentThread, lwEA, lock, (j9objectmonitor_t)newLockword);
 						if (lock == oldValue) {
 							/* CAS succeeded, we can proceed with using the inflated monitor. */

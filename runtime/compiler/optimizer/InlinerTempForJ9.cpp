@@ -5630,15 +5630,20 @@ TR_J9InlinerPolicy::supressInliningRecognizedInitialCallee(TR_CallSite* callsite
             return true;
             }
          break;
-      case TR::java_lang_StringLatin1_indexOf:
       case TR::java_lang_StringLatin1_indexOfChar:
-      case TR::java_lang_StringUTF16_indexOf:
       case TR::java_lang_StringUTF16_indexOfCharUnsafe:
-      case TR::com_ibm_jit_JITHelpers_intrinsicIndexOfStringLatin1:
-      case TR::com_ibm_jit_JITHelpers_intrinsicIndexOfStringUTF16:
       case TR::com_ibm_jit_JITHelpers_intrinsicIndexOfLatin1:
       case TR::com_ibm_jit_JITHelpers_intrinsicIndexOfUTF16:
          if (comp->cg()->getSupportsInlineStringIndexOf())
+            {
+            return true;
+            }
+         break;
+      case TR::java_lang_StringLatin1_indexOf:
+      case TR::java_lang_StringUTF16_indexOf:
+      case TR::com_ibm_jit_JITHelpers_intrinsicIndexOfStringLatin1:
+      case TR::com_ibm_jit_JITHelpers_intrinsicIndexOfStringUTF16:
+         if (comp->cg()->getSupportsInlineStringIndexOfString())
             {
             return true;
             }
@@ -6846,9 +6851,17 @@ static bool treeMatchesCallSite(TR::TreeTop* tt, TR::ResolvedMethodSymbol* calle
 
 
 
-      //make sure classes are compatible
+      // Make sure classes are compatible, but only for non-LambdaForm generated methods, as the class lookup
+      // for LF generated methods would result in failure to obtain the classes, and therefore, can't be checked
+      // for compatibility. It is safe to skip this check for LF methods, as the name and signature matching performed
+      // below would return false if call node and call site LF method classes do not match.
+      //
+      bool isLFMethod = false;
+      if (callsite->_initialCalleeMethod
+          && TR::comp()->fej9()->isLambdaFormGeneratedMethod(callsite->_initialCalleeMethod))
+         isLFMethod = true;
 
-      if (!callNodeClass || !callSiteClass || callerSymbol->getResolvedMethod()->fe()->isInstanceOf (callNodeClass, callSiteClass, true, true, true) != TR_yes)
+      if (!isLFMethod && (!callNodeClass || !callSiteClass || callerSymbol->getResolvedMethod()->fe()->isInstanceOf (callNodeClass, callSiteClass, true, true, true) != TR_yes))
          {
          if (tracer->heuristicLevel())
             {

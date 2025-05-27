@@ -92,6 +92,7 @@ J9::Z::CodeGenerator::initialize()
          && !TR::Compiler->om.canGenerateArraylets())
       {
       cg->setSupportsInlineStringIndexOf();
+      cg->setSupportsInlineStringIndexOfString();
       }
 
    if (cg->getSupportsVectorRegisters() && !comp->getOption(TR_DisableSIMDStringHashCode) && !TR::Compiler->om.canGenerateArraylets())
@@ -228,8 +229,13 @@ J9::Z::CodeGenerator::initialize()
    // Enable high-resolution timer for System.nanoTime() unless we need to support checkpointing (i.e. snapshot mode), which requires
    // that we adjust nanoTime() after restoring checkpoints. This adjustment is currently not implemented for the high res timer, hence
    // we need to stick to the Java nanoTime() implementation.
-   if (!fej9->isSnapshotModeEnabled())
+   // In case of generating a portable code, even though we would not suffer the same issue of adjustment required, in case such code is
+   // used in application that will be checkpointed, it will suffer the same issue of unsupported nanoTime() adjustment for high res timer.
+   // As currently Snapshot mode is available on Linux on Z only, disabling the acceleration on Linux when we are generating portable code.
+   if (!(fej9->isSnapshotModeEnabled() || (comp->target().isLinux() && comp->compilePortableCode())))
+      {
       cg->setSupportsCurrentTimeMaxPrecision();
+      }
 
    // Support BigDecimal Long Lookaside versioning optimizations.
    if (!comp->getOption(TR_DisableBDLLVersioning))
@@ -4231,6 +4237,15 @@ J9::Z::CodeGenerator::inlineDirectCall(
          case TR::com_ibm_jit_JITHelpers_intrinsicIndexOfUTF16:
             resultReg = TR::TreeEvaluator::inlineIntrinsicIndexOf(node, cg, false);
             return true;
+         default:
+            break;
+         }
+      }
+
+   if (cg->getSupportsInlineStringIndexOfString())
+      {
+      switch (methodSymbol->getRecognizedMethod())
+         {
          case TR::java_lang_StringLatin1_indexOf:
          case TR::com_ibm_jit_JITHelpers_intrinsicIndexOfStringLatin1:
                resultReg = TR::TreeEvaluator::inlineVectorizedStringIndexOf(node, cg, false);
