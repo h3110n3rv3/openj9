@@ -121,6 +121,7 @@ changeDirectoryPermission(struct J9PortLibrary *portLibrary, const char* pathnam
 		return J9SH_SUCCESS;
 	}
 }
+
 /* Note that the "pathname" parameter may be changed by this function */
 intptr_t
 createDirectory(struct J9PortLibrary *portLibrary, char *pathname, uintptr_t permission)
@@ -129,8 +130,10 @@ createDirectory(struct J9PortLibrary *portLibrary, char *pathname, uintptr_t per
 	char tempPath[J9SH_MAXPATH];
 	char *current;
 	intptr_t rc;
+	BOOLEAN usingUserHome = FALSE;
+	char homeDir[J9SH_MAXPATH];
 
-	Trc_PRT_shared_createDirectory_Entry( pathname );
+	Trc_PRT_shared_createDirectory_Entry(pathname);
 
 	if (0 == omrfile_mkdir(pathname)) {
 		Trc_PRT_shared_createDirectory_Exit();
@@ -142,21 +145,37 @@ createDirectory(struct J9PortLibrary *portLibrary, char *pathname, uintptr_t per
 
 	omrstr_printf(tempPath, J9SH_MAXPATH, "%s", pathname);
 
-	current = strchr(tempPath+1, DIR_SEPARATOR); /* skip the first '/' */
+	/* if pathname begins with the home directory, mark usingUserHome as true. */
+	if (J9SH_DIRPERM_ABSENT == permission) {
+		memset(homeDir, 0, sizeof(homeDir));
+		if (0 == j9shmem_getDir(portLibrary, NULL,
+				J9SHMEM_GETDIR_USE_USERHOME | J9SHMEM_GETDIR_DO_NOT_APPEND_HIDDENDIR,
+								homeDir, J9SH_MAXPATH)) {
+			if ((pathname != NULL) && (strncmp(pathname, homeDir, strlen(homeDir)) == 0)) {
+				usingUserHome = TRUE;
+			}
+		}
+	}
 
 	if ((J9SH_DIRPERM_ABSENT == permission)
 		|| (J9SH_DIRPERM_ABSENT_GROUPACCESS == permission)
 	) {
-		permission = J9SH_PARENTDIRPERM;
+		if (J9SH_DIRPERM_ABSENT == permission && usingUserHome) {
+			permission = J9SH_DIRPERM_CACHE;
+		} else {
+			permission = J9SH_PARENTDIRPERM;
+		}
 	}
+
+	current = strchr(tempPath+1, DIR_SEPARATOR); /* skip the first '/' */
 
 	while ((NULL != current) && (omrfile_attr(pathname) != EsIsDir)) {
 		char *previous;
 
-		*current='\0';
+		*current = '\0';
 
 #if defined(J9SHSEM_DEBUG)
-		portLibrary->tty_printf(portLibrary, "mkdir %s\n",tempPath);
+		portLibrary->tty_printf(portLibrary, "mkdir %s\n", tempPath);
 #endif
 
 		if (0 == omrfile_mkdir(tempPath)) {
@@ -171,17 +190,16 @@ createDirectory(struct J9PortLibrary *portLibrary, char *pathname, uintptr_t per
 				return J9SH_FAILED;
 			}
 			Trc_PRT_shared_createDirectory_Event2(tempPath);
-  		}
+		}
 
 		previous = current;
 		current = strchr(current+1, DIR_SEPARATOR);
-		*previous=DIR_SEPARATOR;
+		*previous = DIR_SEPARATOR;
 	}
 
 	Trc_PRT_shared_createDirectory_Exit2();
 	return J9SH_SUCCESS;
 }
-
 
 /*
  * Note that this auto-clean function walks all shared memory segments on the system looking
